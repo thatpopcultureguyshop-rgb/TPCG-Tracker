@@ -1,0 +1,4040 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>That Pop Culture Guy — Management Platform</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    @media print {
+      body * { visibility: hidden; }
+      .printable-area, .printable-area * { visibility: visible; }
+      .printable-area {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        background: white !important;
+        color: black !important;
+        padding: 16px !important;
+      }
+      .label-card-print {
+        break-inside: avoid;
+        page-break-inside: avoid;
+        border: 2px solid #000 !important;
+      }
+      .no-print { display: none !important; }
+    }
+    @keyframes shake {
+      0%, 100% { transform: translateX(0); }
+      20%, 60% { transform: translateX(-8px); }
+      40%, 80% { transform: translateX(8px); }
+    }
+    .animate-shake {
+      animation: shake 0.35s ease-in-out;
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 antialiased selection:bg-indigo-500 selection:text-white">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+
+    // ==========================================
+    // 1. SECURITY & STORAGE CONFIGURATION
+    // ==========================================
+    const MASTER_PIN = "2026";
+    const PIN_STORAGE_KEY = "tpcg_custom_pin_v1";
+    const SESSION_UNLOCK_KEY = "tpcg_session_unlocked_v1";
+    const STORAGE_KEY = "tpcg_platform_state_v4";
+
+    const toPence = (gbp) => Math.round((Number(gbp) || 0) * 100);
+    const toGbp = (pence) => Number((pence / 100).toFixed(2));
+    const fmtGBP = (val) =>
+      new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(Number(val) || 0);
+
+    function normalizeUkDateToIso(rawDate) {
+      if (!rawDate) return new Date().toISOString().split("T")[0];
+      const str = String(rawDate).trim();
+      if (/^\d{4}-\d{2}-\d{2}/.test(str)) return str.slice(0, 10);
+
+      const ukSlash = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+      if (ukSlash) {
+        const day = String(ukSlash[1]).padStart(2, "0");
+        const month = String(ukSlash[2]).padStart(2, "0");
+        let year = String(ukSlash[3]);
+        if (year.length === 2) year = "20" + year;
+        return `${year}-${month}-${day}`;
+      }
+
+      const parsed = new Date(str);
+      if (!isNaN(parsed.getTime())) {
+        return parsed.toISOString().split("T")[0];
+      }
+      return new Date().toISOString().split("T")[0];
+    }
+
+    const UK_PLATFORM_PRESETS = {
+      EBAY: {
+        label: "eBay UK Business (12.8% + £0.30)",
+        shortName: "eBay UK (Biz)",
+        calc: (gross, ship) => {
+          const total = (Number(gross) || 0) + (Number(ship) || 0);
+          return total > 0 ? Number((total * 0.128 + 0.3).toFixed(2)) : 0;
+        },
+      },
+      EBAY_PRIVATE: {
+        label: "eBay UK Private Seller (0% Fee)",
+        shortName: "eBay UK (Private)",
+        calc: () => 0,
+      },
+      WHATNOT: {
+        label: "Whatnot UK (8% Gross + 2.9% + £0.30 Total)",
+        shortName: "Whatnot UK",
+        calc: (gross, ship) => {
+          const g = Number(gross) || 0;
+          const total = g + (Number(ship) || 0);
+          return total > 0 ? Number((g * 0.08 + total * 0.029 + 0.3).toFixed(2)) : 0;
+        },
+      },
+      CARDMARKET: {
+        label: "Cardmarket UK (5.0% Trustee Fee)",
+        shortName: "Cardmarket",
+        calc: (gross, ship) => {
+          const total = (Number(gross) || 0) + (Number(ship) || 0);
+          return Number((total * 0.05).toFixed(2));
+        },
+      },
+      SHOPIFY: {
+        label: "Shopify UK Payments (2.0% + £0.25)",
+        shortName: "Shopify UK",
+        calc: (gross, ship) => {
+          const total = (Number(gross) || 0) + (Number(ship) || 0);
+          return total > 0 ? Number((total * 0.02 + 0.25).toFixed(2)) : 0;
+        },
+      },
+      VINTED: {
+        label: "Vinted UK (0% Seller Fee)",
+        shortName: "Vinted UK",
+        calc: () => 0,
+      },
+      IN_PERSON_EVENT: {
+        label: "In-Person Card Show / Cash (0% Fee)",
+        shortName: "In-Person Event",
+        calc: () => 0,
+      },
+      CUSTOM: {
+        label: "Custom / Manual Fee Entry",
+        shortName: "Custom",
+        calc: null,
+      },
+    };
+
+    function calculatePlatformFeeByPreset(presetKey, gross, shipping) {
+      const preset = UK_PLATFORM_PRESETS[presetKey] || UK_PLATFORM_PRESETS.EBAY;
+      return preset.calc ? preset.calc(gross, shipping) : 0;
+    }
+
+    function calculateSaleSplit({
+      acquisitionType,
+      grossSalePrice,
+      shippingChargedToBuyer,
+      platformFeeAmount,
+      actualPostageCost,
+      packagingCost,
+      acquisitionCost = 0,
+      consigneeSplitPercentage = 60,
+    }) {
+      const grossP = toPence(grossSalePrice);
+      const shipInP = toPence(shippingChargedToBuyer);
+      const feeP = toPence(platformFeeAmount);
+      const postOutP = toPence(actualPostageCost);
+      const packP = toPence(packagingCost);
+      const cogsP = acquisitionType === "OWNED_STOCK" ? toPence(acquisitionCost) : 0;
+
+      const totalIngoingP = grossP + shipInP;
+      const totalDirectCostsP = feeP + postOutP + packP + cogsP;
+      const netProfitP = totalIngoingP - totalDirectCostsP;
+
+      if (acquisitionType === "OWNED_STOCK") {
+        return {
+          totalIngoing: toGbp(totalIngoingP),
+          totalDirectCosts: toGbp(totalDirectCostsP),
+          netProfit: toGbp(netProfitP),
+          businessProfitShare: toGbp(netProfitP),
+          consigneePayoutAmount: 0,
+        };
+      }
+
+      if (netProfitP <= 0) {
+        return {
+          totalIngoing: toGbp(totalIngoingP),
+          totalDirectCosts: toGbp(totalDirectCostsP),
+          netProfit: toGbp(netProfitP),
+          businessProfitShare: toGbp(netProfitP),
+          consigneePayoutAmount: 0,
+        };
+      }
+
+      const consigneeP = Math.round((netProfitP * consigneeSplitPercentage) / 100);
+      const businessP = netProfitP - consigneeP;
+
+      return {
+        totalIngoing: toGbp(totalIngoingP),
+        totalDirectCosts: toGbp(totalDirectCostsP),
+        netProfit: toGbp(netProfitP),
+        businessProfitShare: toGbp(businessP),
+        consigneePayoutAmount: toGbp(consigneeP),
+      };
+    }
+
+    function calculateUkTaxLiability(totalBusinessSaleProfit, deductibleOverheadExpenses, entityStructure = "SOLE_TRADER") {
+      const taxableNetProfit = Math.max(0, totalBusinessSaleProfit - deductibleOverheadExpenses);
+      if (taxableNetProfit === 0) {
+        return {
+          entityStructure,
+          totalBusinessSaleProfit,
+          deductibleOverheadExpenses,
+          taxableNetProfit: 0,
+          incomeOrCorpTax: 0,
+          class4NationalInsurance: 0,
+          totalEstimatedTaxLiability: 0,
+          effectiveTaxRatePercent: 0,
+          netProfitAfterTax: 0,
+        };
+      }
+
+      if (entityStructure === "LIMITED_COMPANY") {
+        let corpTax = 0;
+        if (taxableNetProfit <= 50000) {
+          corpTax = taxableNetProfit * 0.19;
+        } else if (taxableNetProfit >= 250000) {
+          corpTax = taxableNetProfit * 0.25;
+        } else {
+          const mainRateTax = taxableNetProfit * 0.25;
+          const marginalRelief = (250000 - taxableNetProfit) * (3 / 200);
+          corpTax = mainRateTax - marginalRelief;
+        }
+        const roundedCorp = Number(corpTax.toFixed(2));
+        return {
+          entityStructure,
+          totalBusinessSaleProfit,
+          deductibleOverheadExpenses,
+          taxableNetProfit: Number(taxableNetProfit.toFixed(2)),
+          incomeOrCorpTax: roundedCorp,
+          class4NationalInsurance: 0,
+          totalEstimatedTaxLiability: roundedCorp,
+          effectiveTaxRatePercent: Number(((roundedCorp / taxableNetProfit) * 100).toFixed(2)),
+          netProfitAfterTax: Number((taxableNetProfit - roundedCorp).toFixed(2)),
+        };
+      }
+
+      let personalAllowance = 12570;
+      if (taxableNetProfit > 100000) {
+        personalAllowance = Math.max(0, 12570 - (taxableNetProfit - 100000) / 2);
+      }
+      const taxableAfterAllowance = Math.max(0, taxableNetProfit - personalAllowance);
+      const basicBandLimit = 37700;
+      const higherThreshold = 125140;
+
+      let incomeTax = 0;
+      if (taxableAfterAllowance > 0) {
+        const basicPortion = Math.min(taxableAfterAllowance, basicBandLimit);
+        incomeTax += basicPortion * 0.2;
+
+        if (taxableAfterAllowance > basicBandLimit) {
+          const higherBandMax = higherThreshold - personalAllowance - basicBandLimit;
+          const higherPortion = Math.min(taxableAfterAllowance - basicBandLimit, Math.max(0, higherBandMax));
+          incomeTax += higherPortion * 0.4;
+        }
+        if (taxableNetProfit > higherThreshold) {
+          incomeTax += (taxableNetProfit - higherThreshold) * 0.45;
+        }
+      }
+
+      let class4Nic = 0;
+      if (taxableNetProfit > 12570) {
+        const mainNicBand = Math.min(taxableNetProfit, 50270) - 12570;
+        class4Nic += mainNicBand * 0.06;
+        if (taxableNetProfit > 50270) {
+          class4Nic += (taxableNetProfit - 50270) * 0.02;
+        }
+      }
+
+      const rIncome = Number(incomeTax.toFixed(2));
+      const rNic = Number(class4Nic.toFixed(2));
+      const totalTax = Number((rIncome + rNic).toFixed(2));
+
+      return {
+        entityStructure,
+        totalBusinessSaleProfit,
+        deductibleOverheadExpenses,
+        taxableNetProfit: Number(taxableNetProfit.toFixed(2)),
+        incomeOrCorpTax: rIncome,
+        class4NationalInsurance: rNic,
+        totalEstimatedTaxLiability: totalTax,
+        effectiveTaxRatePercent: Number(((totalTax / taxableNetProfit) * 100).toFixed(2)),
+        netProfitAfterTax: Number((taxableNetProfit - totalTax).toFixed(2)),
+      };
+    }
+    // ==========================================
+    // 2. EBAY UK CSV PARSER & AUTO-MAPPER ENGINE
+    // ==========================================
+    function parseCsvLine(line) {
+      const result = [];
+      let cur = "";
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+          if (inQuotes && line[i + 1] === '"') {
+            cur += '"';
+            i++;
+          } else {
+            inQuotes = !inQuotes;
+          }
+        } else if (ch === "," && !inQuotes) {
+          result.push(cur.trim());
+          cur = "";
+        } else {
+          cur += ch;
+        }
+      }
+      result.push(cur.trim());
+      return result;
+    }
+
+    function cleanCurrency(val) {
+      if (!val) return 0;
+      const cleaned = String(val).replace(/[^0-9.-]+/g, "");
+      const num = parseFloat(cleaned);
+      return isNaN(num) ? 0 : Math.abs(num);
+    }
+
+    function guessCategoryFromTitle(title) {
+      const t = (title || "").toLowerCase();
+      if (t.includes("pokemon") || t.includes("pokémon") || t.includes("psa") || t.includes("charizard") || t.includes("tcg") || t.includes("magic") || t.includes("umbreon") || t.includes("rayquaza")) return "TRADING_CARDS";
+      if (t.includes("lego") || t.includes("minifig") || t.includes("ucs")) return "LEGO";
+      if (t.includes("funko") || t.includes("pop!")) return "FUNKO_POP";
+      if (t.includes("hot toys") || t.includes("hasbro") || t.includes("figure") || t.includes("sideshow") || t.includes("neca")) return "ACTION_FIGURES";
+      if (t.includes("cgc") || t.includes("comic") || t.includes("marvel") || t.includes("asm")) return "COMICS";
+      if (t.includes("gameboy") || t.includes("nintendo") || t.includes("playstation") || t.includes("sega") || t.includes("zelda")) return "VIDEO_GAMES";
+      return "TRADING_CARDS";
+    }
+
+    function parseEbayCsvReport(csvText, defaultAcquisitionType = "CONSIGNMENT", defaultConsigneeId = "con-1") {
+      const rawLines = csvText
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+
+      let headerIdx = 0;
+      for (let i = 0; i < Math.min(rawLines.length, 15); i++) {
+        const lower = rawLines[i].toLowerCase();
+        if (
+          lower.includes("item number") ||
+          lower.includes("item title") ||
+          lower.includes("title") ||
+          lower.includes("custom label") ||
+          lower.includes("order number")
+        ) {
+          headerIdx = i;
+          break;
+        }
+      }
+
+      if (rawLines.length <= headerIdx + 1) return { mode: "STOCK", rows: [] };
+
+      const headers = parseCsvLine(rawLines[headerIdx]).map((h) => h.toLowerCase());
+      const findCol = (keywords) =>
+        headers.findIndex((h) => keywords.some((kw) => h.includes(kw)));
+
+      const colItemId = findCol(["item number", "item id"]);
+      const colTitle = findCol(["item title", "title", "product"]);
+      const colSku = findCol(["custom label", "sku"]);
+      const colStartPrice = findCol(["start price", "buy it now price", "listed price", "price"]);
+      const colSoldFor = findCol(["sold for", "sale price", "gross"]);
+      const colShipping = findCol(["postage and packaging", "shipping", "delivery"]);
+      const colFvfFixed = findCol(["final value fee - fixed", "fixed fee"]);
+      const colFvfVar = findCol(["final value fee - variable", "platform fee", "fee"]);
+      const colCondition = findCol(["condition"]);
+      const colBuyer = findCol(["buyer username", "buyer name", "buyer"]);
+      const colSaleDate = findCol(["sale date", "order date", "date"]);
+      const colOrderNum = findCol(["order number"]);
+
+      const isSalesReport = colOrderNum !== -1 || colSoldFor !== -1 || colSaleDate !== -1;
+      const rows = [];
+
+      for (let i = headerIdx + 1; i < rawLines.length; i++) {
+        const cols = parseCsvLine(rawLines[i]);
+        if (cols.length < 2) continue;
+
+        const title = (colTitle !== -1 ? cols[colTitle] : "") || "";
+        if (!title || title.toLowerCase().includes("total")) continue;
+
+        const itemId = (colItemId !== -1 ? cols[colItemId] : "") || `EB-${Date.now()}-${i}`;
+        const rawSku = (colSku !== -1 ? cols[colSku] : "") || `EBAY-${String(itemId).slice(-5)}`;
+        const sku = rawSku.toUpperCase();
+        const isOwnedBySku = sku.startsWith("OWN-");
+        const acqType = isOwnedBySku ? "OWNED_STOCK" : defaultAcquisitionType;
+
+        const price = cleanCurrency(
+          colSoldFor !== -1 ? cols[colSoldFor] : colStartPrice !== -1 ? cols[colStartPrice] : 0
+        );
+        const shippingCharged = cleanCurrency(colShipping !== -1 ? cols[colShipping] : 0);
+
+        let fee = 0;
+        if (colFvfFixed !== -1 || colFvfVar !== -1) {
+          fee =
+            cleanCurrency(colFvfFixed !== -1 ? cols[colFvfFixed] : 0) +
+            cleanCurrency(colFvfVar !== -1 ? cols[colFvfVar] : 0);
+        } else if (isSalesReport && price > 0) {
+          fee = calculatePlatformFeeByPreset("EBAY", price, shippingCharged);
+        }
+
+        const rawDateStr = colSaleDate !== -1 ? cols[colSaleDate] : "";
+
+        rows.push({
+          tempId: `row-${i}-${Date.now()}`,
+          mode: isSalesReport ? "SALE" : "STOCK",
+          sku,
+          title,
+          platformItemId: itemId,
+          category: guessCategoryFromTitle(title),
+          condition: (colCondition !== -1 ? cols[colCondition] : "") || "Collector Grade",
+          acquisitionType: acqType,
+          consigneeId: acqType === "CONSIGNMENT" ? defaultConsigneeId : null,
+          acquisitionCost: 0,
+          listedPrice: price || 29.99,
+          grossSalePrice: price || 29.99,
+          shippingChargedToBuyer: shippingCharged,
+          platformFeeAmount: Number(fee.toFixed(2)),
+          actualPostageCost: shippingCharged > 0 ? Number(Math.max(0, shippingCharged - 0.5).toFixed(2)) : 4.45,
+          packagingCost: 1.25,
+          buyerUsername: (colBuyer !== -1 ? cols[colBuyer] : "") || "ebay_uk_buyer",
+          saleDate: normalizeUkDateToIso(rawDateStr),
+        });
+      }
+
+      return { mode: isSalesReport ? "SALE" : "STOCK", rows };
+    }
+
+    // ==========================================
+    // 3. DEEP-DIVE BUSINESS INTELLIGENCE ENGINE
+    // ==========================================
+    function calculateDeepAnalytics(db) {
+      const totalItems = db.inventory.length;
+      const activeItems = db.inventory.filter((i) => i.status === "ACTIVE");
+      const soldItems = db.inventory.filter((i) => i.status !== "ACTIVE");
+
+      const activeConsigned = activeItems.filter((i) => i.acquisitionType === "CONSIGNMENT");
+      const activeOwned = activeItems.filter((i) => i.acquisitionType === "OWNED_STOCK");
+
+      const activePortfolioValue = activeItems.reduce((a, i) => a + Number(i.listedPrice), 0);
+      const activeConsignedValue = activeConsigned.reduce((a, i) => a + Number(i.listedPrice), 0);
+      const activeOwnedRetailValue = activeOwned.reduce((a, i) => a + Number(i.listedPrice), 0);
+      const tiedUpOwnedCogs = activeOwned.reduce((a, i) => a + Number(i.acquisitionCost), 0);
+
+      let projectedActiveBusinessProfit = 0;
+      activeItems.forEach((item) => {
+        const consignee = db.consignees.find((c) => c.id === item.consigneeId);
+        const estFee = calculatePlatformFeeByPreset(item.platform || "EBAY", item.listedPrice, 0);
+        const estSplit = calculateSaleSplit({
+          acquisitionType: item.acquisitionType,
+          grossSalePrice: item.listedPrice,
+          shippingChargedToBuyer: 0,
+          platformFeeAmount: estFee,
+          actualPostageCost: 0,
+          packagingCost: 1.25,
+          acquisitionCost: item.acquisitionCost,
+          consigneeSplitPercentage: consignee ? Number(consignee.defaultSplit) : 60,
+        });
+        projectedActiveBusinessProfit += estSplit.businessProfitShare;
+      });
+
+      const sellThroughRate = totalItems > 0 ? Number(((soldItems.length / totalItems) * 100).toFixed(1)) : 0;
+
+      let totalGrossSales = 0;
+      let totalShippingCharged = 0;
+      let totalPlatformFees = 0;
+      let totalActualPostage = 0;
+      let totalPackaging = 0;
+      let totalSoldOwnedCogs = 0;
+      let totalNetProfit = 0;
+      let totalBusinessKeep = 0;
+      let totalConsigneeShare = 0;
+      let consignmentSaleProfitTotal = 0;
+      let ownedSaleProfitTotal = 0;
+      let totalDaysToSell = 0;
+      let soldWithDatesCount = 0;
+
+      const categoryStats = {};
+      const channelStats = {};
+
+      db.sales.forEach((s) => {
+        const item = db.inventory.find((i) => i.id === s.inventoryItemId);
+        const g = Number(s.grossSalePrice);
+        const shipIn = Number(s.shippingChargedToBuyer);
+        const fee = Number(s.platformFeeAmount);
+        const postOut = Number(s.actualPostageCost);
+        const packOut = Number(s.packagingCost);
+        const cogs = Number(s.ownedStockCogs);
+        const net = Number(s.netProfit);
+        const biz = Number(s.businessProfitShare);
+        const con = Number(s.consigneePayoutAmount);
+
+        totalGrossSales += g;
+        totalShippingCharged += shipIn;
+        totalPlatformFees += fee;
+        totalActualPostage += postOut;
+        totalPackaging += packOut;
+        totalSoldOwnedCogs += cogs;
+        totalNetProfit += net;
+        totalBusinessKeep += biz;
+        totalConsigneeShare += con;
+
+        if (item?.acquisitionType === "CONSIGNMENT") {
+          consignmentSaleProfitTotal += biz;
+        } else {
+          ownedSaleProfitTotal += biz;
+        }
+
+        if (item?.createdAt && s.saleDate) {
+          const d1 = new Date(normalizeUkDateToIso(item.createdAt));
+          const d2 = new Date(normalizeUkDateToIso(s.saleDate));
+          const diffDays = Math.max(1, Math.round((d2 - d1) / (1000 * 60 * 60 * 24)));
+          if (!isNaN(diffDays)) {
+            totalDaysToSell += diffDays;
+            soldWithDatesCount++;
+          }
+        }
+
+        const cat = item?.category || "OTHER";
+        if (!categoryStats[cat]) {
+          categoryStats[cat] = { category: cat, soldCount: 0, activeCount: 0, gross: 0, netProfit: 0, businessKeep: 0 };
+        }
+        categoryStats[cat].soldCount += 1;
+        categoryStats[cat].gross += g;
+        categoryStats[cat].netProfit += net;
+        categoryStats[cat].businessKeep += biz;
+
+        const plat = item?.platform || "EBAY";
+        if (!channelStats[plat]) {
+          channelStats[plat] = { platform: plat, count: 0, gross: 0, fees: 0, businessKeep: 0 };
+        }
+        channelStats[plat].count += 1;
+        channelStats[plat].gross += g + shipIn;
+        channelStats[plat].fees += fee;
+        channelStats[plat].businessKeep += biz;
+      });
+
+      activeItems.forEach((i) => {
+        const cat = i.category || "OTHER";
+        if (!categoryStats[cat]) {
+          categoryStats[cat] = { category: cat, soldCount: 0, activeCount: 0, gross: 0, netProfit: 0, businessKeep: 0 };
+        }
+        categoryStats[cat].activeCount += 1;
+      });
+
+      const totalTopLineIngoing = totalGrossSales + totalShippingCharged;
+      const feeBleedRatePercent =
+        totalTopLineIngoing > 0 ? Number(((totalPlatformFees / totalTopLineIngoing) * 100).toFixed(2)) : 0;
+      const shippingRecoveryBalance = toGbp(
+        (totalShippingCharged - (totalActualPostage + totalPackaging)) * 100
+      );
+      const ownedStockRoiPercent =
+        totalSoldOwnedCogs > 0 ? Number(((ownedSaleProfitTotal / totalSoldOwnedCogs) * 100).toFixed(1)) : 0;
+      const businessKeepRatePercent =
+        totalTopLineIngoing > 0 ? Number(((totalBusinessKeep / totalTopLineIngoing) * 100).toFixed(1)) : 0;
+      const avgDaysToSell =
+        soldWithDatesCount > 0 ? Number((totalDaysToSell / soldWithDatesCount).toFixed(1)) : 6.5;
+
+      const postageAndPackTotal = totalActualPostage + totalPackaging;
+      const waterfall = {
+        feesPct: totalTopLineIngoing > 0 ? Number(((totalPlatformFees / totalTopLineIngoing) * 100).toFixed(1)) : 0,
+        postagePackPct: totalTopLineIngoing > 0 ? Number(((postageAndPackTotal / totalTopLineIngoing) * 100).toFixed(1)) : 0,
+        cogsPct: totalTopLineIngoing > 0 ? Number(((totalSoldOwnedCogs / totalTopLineIngoing) * 100).toFixed(1)) : 0,
+        consigneePct: totalTopLineIngoing > 0 ? Number(((totalConsigneeShare / totalTopLineIngoing) * 100).toFixed(1)) : 0,
+        businessKeepPct: totalTopLineIngoing > 0 ? Number(((totalBusinessKeep / totalTopLineIngoing) * 100).toFixed(1)) : 0,
+      };
+
+      const now = new Date();
+      const agingInventory = activeItems
+        .map((item) => {
+          const listedDate = new Date(normalizeUkDateToIso(item.createdAt || "2026-10-01"));
+          const daysListed = Math.max(1, Math.round((now - listedDate) / (1000 * 60 * 60 * 24)));
+          return { ...item, daysListed };
+        })
+        .sort((a, b) => b.daysListed - a.daysListed);
+
+      const consigneeLeaderboard = db.consignees
+        .map((c) => {
+          const cItems = db.inventory.filter((i) => i.consigneeId === c.id);
+          const cSales = db.sales.filter((s) => {
+            const it = db.inventory.find((i) => i.id === s.inventoryItemId);
+            return it?.consigneeId === c.id;
+          });
+          const grossGenerated = cSales.reduce((a, s) => a + Number(s.grossSalePrice), 0);
+          const business40Earned = cSales.reduce((a, s) => a + Number(s.businessProfitShare), 0);
+          const consignee60Earned = cSales.reduce((a, s) => a + Number(s.consigneePayoutAmount), 0);
+          return {
+            id: c.id,
+            name: c.name,
+            totalItems: cItems.length,
+            soldCount: cSales.length,
+            grossGenerated: toGbp(grossGenerated * 100),
+            business40Earned: toGbp(business40Earned * 100),
+            consignee60Earned: toGbp(consignee60Earned * 100),
+          };
+        })
+        .sort((a, b) => b.business40Earned - a.business40Earned);
+
+      return {
+        totalItems,
+        activeCount: activeItems.length,
+        soldCount: soldItems.length,
+        sellThroughRate,
+        activePortfolioValue: toGbp(activePortfolioValue * 100),
+        activeConsignedValue: toGbp(activeConsignedValue * 100),
+        activeOwnedRetailValue: toGbp(activeOwnedRetailValue * 100),
+        tiedUpOwnedCogs: toGbp(tiedUpOwnedCogs * 100),
+        projectedActiveBusinessProfit: toGbp(projectedActiveBusinessProfit * 100),
+        totalTopLineIngoing: toGbp(totalTopLineIngoing * 100),
+        totalGrossSales: toGbp(totalGrossSales * 100),
+        totalShippingCharged: toGbp(totalShippingCharged * 100),
+        totalPlatformFees: toGbp(totalPlatformFees * 100),
+        totalActualPostage: toGbp(totalActualPostage * 100),
+        totalPackaging: toGbp(totalPackaging * 100),
+        totalSoldOwnedCogs: toGbp(totalSoldOwnedCogs * 100),
+        totalBusinessKeep: toGbp(totalBusinessKeep * 100),
+        feeBleedRatePercent,
+        shippingRecoveryBalance,
+        ownedStockRoiPercent,
+        businessKeepRatePercent,
+        avgDaysToSell,
+        consignmentSaleProfitTotal: toGbp(consignmentSaleProfitTotal * 100),
+        ownedSaleProfitTotal: toGbp(ownedSaleProfitTotal * 100),
+        totalConsigneeShare: toGbp(totalConsigneeShare * 100),
+        waterfall,
+        categoryBreakdown: Object.values(categoryStats).sort((a, b) => b.businessKeep - a.businessKeep),
+        channelBreakdown: Object.values(channelStats).sort((a, b) => b.gross - a.gross),
+        agingInventory,
+        consigneeLeaderboard,
+      };
+    }
+
+    // ==========================================
+    // 4. DETERMINISTIC SVG BARCODE GENERATOR
+    // ==========================================
+    function SvgBarcode({ value }) {
+      const bars = useMemo(() => {
+        const str = `*${(value || "SKU").toUpperCase()}*`;
+        const pattern = [];
+        for (let i = 0; i < str.length; i++) {
+          const code = str.charCodeAt(i);
+          pattern.push((code % 3) + 1);
+          pattern.push(((code >> 2) % 2) + 1);
+          pattern.push(((code >> 4) % 3) + 1);
+          pattern.push(1);
+        }
+        return pattern;
+      }, [value]);
+
+      let currentX = 0;
+      const rects = [];
+      bars.forEach((width, idx) => {
+        if (idx % 2 === 0) {
+          rects.push({ x: currentX, width: width * 1.8 });
+        }
+        currentX += width * 1.8;
+      });
+
+      return (
+        <svg
+          viewBox={`0 0 ${Math.max(currentX, 100)} 36`}
+          className="w-full h-9"
+          preserveAspectRatio="none"
+        >
+          {rects.map((r, i) => (
+            <rect key={i} x={r.x} y="0" width={r.width} height="36" fill="currentColor" />
+          ))}
+        </svg>
+      );
+    }
+
+    // ==========================================
+    // 5. SEED DATABASE
+    // ==========================================
+    const INITIAL_DATA = {
+      consignees: [
+        {
+          id: "con-1",
+          name: "Callum Fraser",
+          email: "callum.fraser@example.co.uk",
+          phone: "07700 900412",
+          address: "14 Victoria Road, Glasgow, G12 9BG",
+          bankDetails: "Sort: 04-00-04 | Acc: 84920114 (Monzo)",
+          defaultSplit: 60,
+          notes: "High-value Pokémon & Japanese TCG collector.",
+        },
+        {
+          id: "con-2",
+          name: "Sarah Jenkins",
+          email: "s.jenkins.lego@example.co.uk",
+          phone: "07700 900889",
+          address: "88 Abbey Lane, Sheffield, S8 0BN",
+          bankDetails: "Sort: 20-76-89 | Acc: 44192831 (Barclays)",
+          defaultSplit: 60,
+          notes: "Retired Star Wars UCS LEGO sets & sealed minifigures.",
+        },
+        {
+          id: "con-3",
+          name: "Marcus Vance",
+          email: "mvance.comics@example.co.uk",
+          phone: "07700 900155",
+          address: "42 Park Street, Bristol, BS1 5JG",
+          bankDetails: "Sort: 60-83-71 | Acc: 29104482 (Starling)",
+          defaultSplit: 60,
+          notes: "Hot Toys 1/6 Figures & CGC Graded Silver/Bronze Age Keys.",
+        },
+      ],
+      inventory: [
+        {
+          id: "inv-1",
+          sku: "TCG-PKM-001",
+          title: "1999 Pokémon Base Set Shadowless Charizard Holo — PSA 8",
+          category: "TRADING_CARDS",
+          acquisitionType: "CONSIGNMENT",
+          consigneeId: "con-1",
+          acquisitionCost: 0,
+          condition: "PSA 8 NM-MT",
+          storageLocation: "Vault A-01",
+          listedPrice: 1450.0,
+          status: "PAYOUT_PENDING",
+          platform: "EBAY",
+          platformItemId: "285910492811",
+          createdAt: "2026-09-12",
+        },
+        {
+          id: "inv-2",
+          sku: "LGO-SW-002",
+          title: "LEGO Star Wars 10179 UCS Millennium Falcon (First Edition, Complete)",
+          category: "LEGO",
+          acquisitionType: "CONSIGNMENT",
+          consigneeId: "con-2",
+          acquisitionCost: 0,
+          condition: "Used - 100% Complete w/ Box & COA",
+          storageLocation: "Rack LGO-04",
+          listedPrice: 980.0,
+          status: "PAYOUT_PENDING",
+          platform: "EBAY",
+          platformItemId: "285910884120",
+          createdAt: "2026-09-18",
+        },
+        {
+          id: "inv-3",
+          sku: "OWN-FUN-003",
+          title: "Funko Pop! Star Wars #01 Darth Vader (Blue Box Grails Lot of 4)",
+          category: "FUNKO_POP",
+          acquisitionType: "OWNED_STOCK",
+          consigneeId: null,
+          acquisitionCost: 115.0,
+          condition: "Mint w/ Hard Stacks",
+          storageLocation: "Shelf B-12",
+          listedPrice: 310.0,
+          status: "COMPLETED",
+          platform: "WHATNOT",
+          platformItemId: "WN-LIVE-882",
+          createdAt: "2026-09-20",
+        },
+        {
+          id: "inv-4",
+          sku: "FIG-HT-004",
+          title: "Hot Toys MMS678 Star Wars Darth Vader (Obi-Wan Series Deluxe 1/6)",
+          category: "ACTION_FIGURES",
+          acquisitionType: "CONSIGNMENT",
+          consigneeId: "con-3",
+          acquisitionCost: 0,
+          condition: "MISB Sealed Brown Shipper",
+          storageLocation: "Bay FIG-09",
+          listedPrice: 365.0,
+          status: "ACTIVE",
+          platform: "EBAY",
+          platformItemId: "285919002145",
+          createdAt: "2026-09-25",
+        },
+        {
+          id: "inv-5",
+          sku: "OWN-VG-005",
+          title: "Pokémon Emerald Version (GameBoy Advance, CIB UK PAL Boxed)",
+          category: "VIDEO_GAMES",
+          acquisitionType: "OWNED_STOCK",
+          consigneeId: null,
+          acquisitionCost: 140.0,
+          condition: "Very Good CIB - New Dry Battery",
+          storageLocation: "Vault B-03",
+          listedPrice: 329.99,
+          status: "ACTIVE",
+          platform: "EBAY",
+          platformItemId: "285920119044",
+          createdAt: "2026-10-01",
+        },
+        {
+          id: "inv-6",
+          sku: "TCG-PKM-006",
+          title: "Pokémon Umbreon VMAX Alt Art (Evolving Skies 215/203) — PSA 10",
+          category: "TRADING_CARDS",
+          acquisitionType: "CONSIGNMENT",
+          consigneeId: "con-1",
+          acquisitionCost: 0,
+          condition: "PSA 10 Gem Mint",
+          storageLocation: "Vault A-02",
+          listedPrice: 1150.0,
+          status: "ACTIVE",
+          platform: "CARDMARKET",
+          platformItemId: "CM-9940128",
+          createdAt: "2026-10-08",
+        },
+      ],
+      sales: [
+        {
+          id: "sale-1",
+          inventoryItemId: "inv-1",
+          saleDate: "2026-10-02",
+          buyerUsername: "uk_pokecollector99",
+          grossSalePrice: 1450.0,
+          shippingChargedToBuyer: 11.95,
+          platformFeeAmount: 162.5,
+          actualPostageCost: 11.15,
+          packagingCost: 3.3,
+          ownedStockCogs: 0,
+          netProfit: 1285.0,
+          businessProfitShare: 514.0,
+          consigneePayoutAmount: 771.0,
+          payoutStatus: "UNPAID",
+          payoutId: null,
+        },
+        {
+          id: "sale-2",
+          inventoryItemId: "inv-2",
+          saleDate: "2026-10-06",
+          buyerUsername: "brick_master_ldn",
+          grossSalePrice: 980.0,
+          shippingChargedToBuyer: 18.5,
+          platformFeeAmount: 112.4,
+          actualPostageCost: 19.8,
+          packagingCost: 6.3,
+          ownedStockCogs: 0,
+          netProfit: 860.0,
+          businessProfitShare: 344.0,
+          consigneePayoutAmount: 516.0,
+          payoutStatus: "UNPAID",
+          payoutId: null,
+        },
+        {
+          id: "sale-3",
+          inventoryItemId: "inv-3",
+          saleDate: "2026-09-29",
+          buyerUsername: "funko_vault_uk",
+          grossSalePrice: 310.0,
+          shippingChargedToBuyer: 6.99,
+          platformFeeAmount: 31.8,
+          actualPostageCost: 5.95,
+          packagingCost: 2.24,
+          ownedStockCogs: 115.0,
+          netProfit: 162.0,
+          businessProfitShare: 162.0,
+          consigneePayoutAmount: 0,
+          payoutStatus: "NOT_APPLICABLE",
+          payoutId: null,
+        },
+      ],
+      payouts: [],
+      expenses: [
+        {
+          id: "exp-1",
+          expenseDate: "2026-09-15",
+          category: "STORAGE_AND_RENT",
+          merchant: "SafeStore UK Self Storage",
+          description: "Climate-controlled collector vault unit (Monthly)",
+          amount: 185.0,
+          isTaxDeductible: true,
+          allocatedToItemSale: false,
+          receiptName: "safestore-sep-2026.pdf",
+        },
+        {
+          id: "exp-2",
+          expenseDate: "2026-09-28",
+          category: "EVENT_TABLES_AND_TRAVEL",
+          merchant: "London Card Show",
+          description: "2x Vendor Exhibitor Tables + Insurance",
+          amount: 240.0,
+          isTaxDeductible: true,
+          allocatedToItemSale: false,
+          receiptName: "london-card-show-invoice.pdf",
+        },
+        {
+          id: "exp-3",
+          expenseDate: "2026-10-03",
+          category: "PLATFORM_SUBSCRIPTIONS",
+          merchant: "eBay UK Anchor Shop & CardLadder Pro",
+          description: "Monthly store subscription & market pricing tools",
+          amount: 74.99,
+          isTaxDeductible: true,
+          allocatedToItemSale: false,
+          receiptName: "ebay-sub-oct.pdf",
+        },
+      ],
+      cashFlow: [
+        {
+          id: "cf-1",
+          entryDate: "2026-09-15",
+          type: "OUTGOING",
+          source: "OPERATING_EXPENSE",
+          amount: 185.0,
+          description: "SafeStore UK Self Storage — Climate-controlled collector vault",
+        },
+        {
+          id: "cf-2",
+          entryDate: "2026-09-20",
+          type: "OUTGOING",
+          source: "OWNED_STOCK_ACQUISITION",
+          amount: 115.0,
+          description: "COGS Acquisition: [OWN-FUN-003] Funko Pop Darth Vader Lot",
+        },
+        {
+          id: "cf-3",
+          entryDate: "2026-09-28",
+          type: "OUTGOING",
+          source: "OPERATING_EXPENSE",
+          amount: 240.0,
+          description: "London Card Show — 2x Vendor Exhibitor Tables",
+        },
+        {
+          id: "cf-4",
+          entryDate: "2026-09-29",
+          type: "INGOING",
+          source: "SALE_GROSS_RECEIPT",
+          amount: 316.99,
+          description: "Gross Receipt: [OWN-FUN-003] Funko Pop! Star Wars Lot",
+          saleRecordId: "sale-3",
+        },
+        {
+          id: "cf-5",
+          entryDate: "2026-09-29",
+          type: "OUTGOING",
+          source: "PLATFORM_FEE_DEDUCTION",
+          amount: 39.99,
+          description: "Fees, Postage & Packaging: [OWN-FUN-003]",
+          saleRecordId: "sale-3",
+        },
+        {
+          id: "cf-6",
+          entryDate: "2026-10-02",
+          type: "INGOING",
+          source: "SALE_GROSS_RECEIPT",
+          amount: 1461.95,
+          description: "Gross Receipt: [TCG-PKM-001] 1999 Base Set Shadowless Charizard PSA 8",
+          saleRecordId: "sale-1",
+        },
+        {
+          id: "cf-7",
+          entryDate: "2026-10-02",
+          type: "OUTGOING",
+          source: "PLATFORM_FEE_DEDUCTION",
+          amount: 176.95,
+          description: "Fees, Postage & Packaging: [TCG-PKM-001]",
+          saleRecordId: "sale-1",
+        },
+        {
+          id: "cf-8",
+          entryDate: "2026-10-06",
+          type: "INGOING",
+          source: "SALE_GROSS_RECEIPT",
+          amount: 998.5,
+          description: "Gross Receipt: [LGO-SW-002] LEGO 10179 UCS Millennium Falcon",
+          saleRecordId: "sale-2",
+        },
+        {
+          id: "cf-9",
+          entryDate: "2026-10-06",
+          type: "OUTGOING",
+          source: "PLATFORM_FEE_DEDUCTION",
+          amount: 138.5,
+          description: "Fees, Postage & Packaging: [LGO-SW-002]",
+          saleRecordId: "sale-2",
+        },
+      ],
+      documents: [
+        {
+          id: "doc-1",
+          fileName: "callum-fraser-signed-60-40-contract.pdf",
+          documentType: "CONSIGNMENT_AGREEMENT",
+          linkedTo: "Consignee: Callum Fraser",
+          fileSize: "248 KB",
+          uploadedAt: "2026-09-10",
+        },
+        {
+          id: "doc-2",
+          fileName: "sarah-jenkins-signed-mandate.pdf",
+          documentType: "CONSIGNMENT_AGREEMENT",
+          linkedTo: "Consignee: Sarah Jenkins",
+          fileSize: "192 KB",
+          uploadedAt: "2026-09-14",
+        },
+        {
+          id: "doc-3",
+          fileName: "safestore-sep-2026.pdf",
+          documentType: "EXPENSE_RECEIPT",
+          linkedTo: "Expense: SafeStore UK Self Storage",
+          fileSize: "115 KB",
+          uploadedAt: "2026-09-15",
+        },
+        {
+          id: "doc-4",
+          fileName: "royal-mail-special-delivery-TCG-PKM-001.jpg",
+          documentType: "PROOF_OF_POSTAGE",
+          linkedTo: "Sale: TCG-PKM-001 (£11.15)",
+          fileSize: "840 KB",
+          uploadedAt: "2026-10-02",
+        },
+      ],
+    };
+    // ==========================================
+    // 6. PIN PASSCODE LOCK SCREEN COMPONENT
+    // ==========================================
+    function PinLockScreen({ activePin, onUnlock }) {
+      const [enteredPin, setEnteredPin] = useState("");
+      const [errorShake, setErrorShake] = useState(false);
+
+      const verifyAttempt = (candidate) => {
+        if (candidate === activePin) {
+          onUnlock();
+        } else {
+          setErrorShake(true);
+          setTimeout(() => {
+            setEnteredPin("");
+            setErrorShake(false);
+          }, 400);
+        }
+      };
+
+      const handleDigitPress = (digit) => {
+        if (enteredPin.length >= activePin.length) return;
+        const nextPin = enteredPin + digit;
+        setEnteredPin(nextPin);
+        if (nextPin.length === activePin.length) {
+          setTimeout(() => verifyAttempt(nextPin), 120);
+        }
+      };
+
+      const handleBackspace = () => {
+        setEnteredPin((prev) => prev.slice(0, -1));
+      };
+
+      useEffect(() => {
+        const handleKeyDown = (e) => {
+          if (e.key >= "0" && e.key <= "9") {
+            handleDigitPress(e.key);
+          } else if (e.key === "Backspace") {
+            handleBackspace();
+          } else if (e.key === "Escape") {
+            setEnteredPin("");
+          }
+        };
+        window.addEventListener("keydown", handleKeyDown);
+        return () => window.removeEventListener("keydown", handleKeyDown);
+      }, [enteredPin, activePin]);
+
+      return (
+        <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4 select-none">
+          <div className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-3xl p-7 shadow-2xl text-center">
+            <div className="w-14 h-14 rounded-2xl bg-indigo-600 mx-auto flex items-center justify-center font-black text-2xl text-white shadow-lg shadow-indigo-600/30 mb-4">
+              TPG
+            </div>
+            <h1 className="text-xl font-bold text-white">That Pop Culture Guy</h1>
+            <p className="text-xs text-slate-400 mt-1">
+              Enter your {activePin.length}-digit security PIN to unlock the platform
+            </p>
+
+            <div className={`flex justify-center gap-3.5 my-7 ${errorShake ? "animate-shake" : ""}`}>
+              {Array.from({ length: activePin.length }).map((_, idx) => {
+                const filled = idx < enteredPin.length;
+                return (
+                  <div
+                    key={idx}
+                    className={`w-4 h-4 rounded-full transition-all duration-150 ${
+                      errorShake
+                        ? "bg-rose-500 scale-110"
+                        : filled
+                        ? "bg-indigo-500 scale-110 shadow-md shadow-indigo-500/50"
+                        : "bg-slate-800 border border-slate-700"
+                    }`}
+                  />
+                );
+              })}
+            </div>
+
+            {errorShake && (
+              <p className="text-xs text-rose-400 font-medium -mt-3 mb-4">
+                Incorrect PIN. Please try again.
+              </p>
+            )}
+
+            <div className="grid grid-cols-3 gap-3">
+              {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((digit) => (
+                <button
+                  key={digit}
+                  type="button"
+                  onClick={() => handleDigitPress(digit)}
+                  className="h-14 rounded-2xl bg-slate-950 hover:bg-slate-800 active:bg-indigo-600 border border-slate-800 text-lg font-bold text-white transition flex items-center justify-center"
+                >
+                  {digit}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => setEnteredPin("")}
+                className="h-14 rounded-2xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-xs font-semibold text-slate-400 hover:text-white transition flex items-center justify-center"
+              >
+                CLEAR
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDigitPress("0")}
+                className="h-14 rounded-2xl bg-slate-950 hover:bg-slate-800 active:bg-indigo-600 border border-slate-800 text-lg font-bold text-white transition flex items-center justify-center"
+              >
+                0
+              </button>
+              <button
+                type="button"
+                onClick={handleBackspace}
+                className="h-14 rounded-2xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-sm font-semibold text-slate-300 hover:text-white transition flex items-center justify-center"
+              >
+                ⌫
+              </button>
+            </div>
+
+            <p className="text-[11px] text-slate-500 mt-6">
+              Protected Consignment, Inventory & UK Tax Vault
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // 7. EBAY UK CSV IMPORTER MODAL
+    // ==========================================
+    const SAMPLE_EBAY_ACTIVE_CSV = `Item number,Title,Custom label (SKU),Start price,Condition
+2859331001,Pokemon 151 Charizard ex SIR 199/165 PSA 10 Gem Mint,TCG-PKM-101,£420.00,Graded - PSA 10
+2859331002,LEGO Star Wars 75367 Venator-Class Republic Attack Cruiser MISB,LGO-SW-102,£489.99,New Sealed
+2859331003,OWN-Funko Pop Marvel Ghost Rider #18 Metallic SDCC Exclusive,OWN-FUN-103,£260.00,Near Mint w/ Stack`;
+
+    const SAMPLE_EBAY_SALES_CSV = `Order number,Item number,Item title,Custom label (SKU),Buyer username,Sale date,Sold for,Postage and packaging,Final Value Fee - fixed,Final Value Fee - variable
+20-11492-88210,2859442001,Pokemon Rayquaza VMAX Alt Art 218/203 Evolving Skies PSA 10,TCG-PKM-201,poke_king_uk,2026-10-12,£540.00,£8.95,£0.30,£70.26
+20-11492-88214,2859442002,LEGO Lord of the Rings 10237 Tower of Orthanc Complete Boxed,LGO-LOTR-202,shire_bricks,2026-10-14,£345.00,£14.50,£0.30,£46.01`;
+
+    function EbayCsvImportModal({ consignees, onClose, onImportRows }) {
+      const [defaultAcqType, setDefaultAcqType] = useState("CONSIGNMENT");
+      const [defaultConsigneeId, setDefaultConsigneeId] = useState(consignees[0]?.id || "con-1");
+      const [parsedRows, setParsedRows] = useState([]);
+      const [reportMode, setReportMode] = useState("STOCK");
+      const [sourceFileName, setSourceFileName] = useState("");
+
+      const handleFileUpload = (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        setSourceFileName(file.name);
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+          const text = evt.target.result;
+          const result = parseEbayCsvReport(text, defaultAcqType, defaultConsigneeId);
+          setReportMode(result.mode);
+          setParsedRows(result.rows);
+        };
+        reader.readAsText(file);
+      };
+
+      const loadSampleCsv = (type) => {
+        const sample = type === "SALES" ? SAMPLE_EBAY_SALES_CSV : SAMPLE_EBAY_ACTIVE_CSV;
+        setSourceFileName(type === "SALES" ? "ebay-uk-orders-report-oct-2026.csv" : "ebay-uk-active-listings-oct-2026.csv");
+        const result = parseEbayCsvReport(sample, defaultAcqType, defaultConsigneeId);
+        setReportMode(result.mode);
+        setParsedRows(result.rows);
+      };
+
+      const updateRowField = (tempId, field, value) => {
+        setParsedRows((prev) =>
+          prev.map((r) => (r.tempId === tempId ? { ...r, [field]: value } : r))
+        );
+      };
+
+      return (
+        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 no-print">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-4xl w-full p-6 max-h-[92vh] overflow-y-auto">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-4 mb-4">
+              <div>
+                <h3 className="text-lg font-bold text-white">
+                  eBay UK Seller Hub CSV Importer (Stock & Sales Reports)
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Upload your eBay Active Listings CSV or Orders CSV to auto-populate inventory and match sales
+                </p>
+              </div>
+              <button
+                onClick={onClose}
+                className="text-xs text-slate-400 hover:text-white px-3 py-1.5 rounded-lg bg-slate-800"
+              >
+                ✕ Close
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4 bg-slate-950 p-3.5 rounded-xl border border-slate-800 text-xs">
+              <div>
+                <label className="text-slate-400 block mb-1">Default Ownership for Imported Rows</label>
+                <select
+                  value={defaultAcqType}
+                  onChange={(e) => setDefaultAcqType(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white"
+                >
+                  <option value="CONSIGNMENT">CONSIGNMENT (60/40 Split)</option>
+                  <option value="OWNED_STOCK">OWNED_STOCK (100% Business)</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-slate-400 block mb-1">Default Consignee</label>
+                <select
+                  value={defaultConsigneeId}
+                  onChange={(e) => setDefaultConsigneeId(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white"
+                >
+                  {consignees.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-slate-400 block mb-1">Upload eBay CSV File</label>
+                <input
+                  type="file"
+                  accept=".csv,text/csv"
+                  onChange={handleFileUpload}
+                  className="w-full text-slate-300 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:bg-indigo-600 file:text-white file:font-medium text-xs"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 mb-4 text-xs">
+              <span className="text-slate-400">Quick Test Samples:</span>
+              <button
+                type="button"
+                onClick={() => loadSampleCsv("STOCK")}
+                className="bg-slate-800 hover:bg-slate-700 text-indigo-300 px-3 py-1.5 rounded-lg border border-slate-700 transition"
+              >
+                Load Sample Active Stock CSV
+              </button>
+              <button
+                type="button"
+                onClick={() => loadSampleCsv("SALES")}
+                className="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-3 py-1.5 rounded-lg border border-slate-700 transition"
+              >
+                Load Sample Sold Orders CSV
+              </button>
+            </div>
+
+            {parsedRows.length > 0 && (
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-semibold text-emerald-400">
+                    Detected Format: {reportMode === "SALE" ? "eBay Sold Orders Report (Auto-runs 60/40 Split & Matches Stock)" : "eBay Active Stock Report"} ({parsedRows.length} items)
+                  </span>
+                </div>
+
+                <div className="overflow-x-auto max-h-64 border border-slate-800 rounded-xl mb-4">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-950 text-slate-400 uppercase sticky top-0">
+                      <tr>
+                        <th className="py-2 px-2">SKU</th>
+                        <th className="py-2 px-2">Title</th>
+                        <th className="py-2 px-2">Price (£)</th>
+                        {reportMode === "SALE" && <th className="py-2 px-2">eBay Fee (£)</th>}
+                        <th className="py-2 px-2">Ownership</th>
+                        <th className="py-2 px-2">Consignee / COGS</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800">
+                      {parsedRows.map((r) => (
+                        <tr key={r.tempId} className="bg-slate-900/60">
+                          <td className="py-2 px-2 font-mono text-indigo-300">{r.sku}</td>
+                          <td className="py-2 px-2 text-white max-w-xs truncate">{r.title}</td>
+                          <td className="py-2 px-2 font-semibold text-white">
+                            {fmtGBP(r.mode === "SALE" ? r.grossSalePrice : r.listedPrice)}
+                          </td>
+                          {reportMode === "SALE" && (
+                            <td className="py-2 px-2 text-rose-300">-{fmtGBP(r.platformFeeAmount)}</td>
+                          )}
+                          <td className="py-2 px-2">
+                            <select
+                              value={r.acquisitionType}
+                              onChange={(e) => updateRowField(r.tempId, "acquisitionType", e.target.value)}
+                              className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] text-white"
+                            >
+                              <option value="CONSIGNMENT">CONSIGNMENT</option>
+                              <option value="OWNED_STOCK">OWNED_STOCK</option>
+                            </select>
+                          </td>
+                          <td className="py-2 px-2">
+                            {r.acquisitionType === "CONSIGNMENT" ? (
+                              <select
+                                value={r.consigneeId || defaultConsigneeId}
+                                onChange={(e) => updateRowField(r.tempId, "consigneeId", e.target.value)}
+                                className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] text-indigo-200"
+                              >
+                                {consignees.map((c) => (
+                                  <option key={c.id} value={c.id}>
+                                    {c.name}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <input
+                                type="number"
+                                step="0.01"
+                                placeholder="COGS £"
+                                value={r.acquisitionCost}
+                                onChange={(e) => updateRowField(r.tempId, "acquisitionCost", Number(e.target.value))}
+                                className="w-24 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] text-amber-300"
+                              />
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="px-4 py-2 rounded-lg text-xs text-slate-400"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onImportRows(parsedRows, sourceFileName)}
+                    className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-4 py-2 rounded-lg shadow"
+                  >
+                    Import {parsedRows.length} eBay Records into Platform
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // 8. RECORD SALE MODAL WITH UK FEE PRESETS
+    // ==========================================
+    function RecordSaleModal({ item, consignee, onClose, onConfirm }) {
+      const initialPreset = UK_PLATFORM_PRESETS[item.platform] ? item.platform : "EBAY";
+      const [preset, setPreset] = useState(initialPreset);
+      const [gross, setGross] = useState(item.listedPrice);
+      const [shippingCharged, setShippingCharged] = useState(6.95);
+      const [platformFee, setPlatformFee] = useState(() =>
+        calculatePlatformFeeByPreset(initialPreset, item.listedPrice, 6.95)
+      );
+      const [actualPostage, setActualPostage] = useState(6.45);
+      const [packagingCost, setPackagingCost] = useState(1.5);
+      const [buyerUsername, setBuyerUsername] = useState("");
+      const [proofFileName, setProofFileName] = useState("");
+
+      const handlePresetChange = (newPreset) => {
+        setPreset(newPreset);
+        if (newPreset !== "CUSTOM") {
+          setPlatformFee(calculatePlatformFeeByPreset(newPreset, gross, shippingCharged));
+        }
+      };
+
+      const handleGrossChange = (val) => {
+        setGross(val);
+        if (preset !== "CUSTOM") {
+          setPlatformFee(calculatePlatformFeeByPreset(preset, val, shippingCharged));
+        }
+      };
+
+      const handleShippingChange = (val) => {
+        setShippingCharged(val);
+        if (preset !== "CUSTOM") {
+          setPlatformFee(calculatePlatformFeeByPreset(preset, gross, val));
+        }
+      };
+
+      const splitPreview = useMemo(
+        () =>
+          calculateSaleSplit({
+            acquisitionType: item.acquisitionType,
+            grossSalePrice: gross,
+            shippingChargedToBuyer: shippingCharged,
+            platformFeeAmount: platformFee,
+            actualPostageCost: actualPostage,
+            packagingCost,
+            acquisitionCost: item.acquisitionCost,
+            consigneeSplitPercentage: consignee ? consignee.defaultSplit : 60,
+          }),
+        [item, consignee, gross, shippingCharged, platformFee, actualPostage, packagingCost]
+      );
+
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        onConfirm({
+          grossSalePrice: Number(gross),
+          shippingChargedToBuyer: Number(shippingCharged || 0),
+          platformFeeAmount: Number(platformFee || 0),
+          actualPostageCost: Number(actualPostage || 0),
+          packagingCost: Number(packagingCost || 0),
+          buyerUsername: buyerUsername || "uk_collector_buyer",
+          proofFileName,
+        });
+      };
+
+      return (
+        <div className="fixed inset-0 bg-black/75 z-50 flex items-center justify-center p-4 no-print">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 max-h-[92vh] overflow-y-auto">
+            <h3 className="text-lg font-bold text-white mb-1">
+              Record Sale & Auto-Calculate UK Fees
+            </h3>
+            <p className="text-xs text-indigo-300 mb-4">
+              [{item.sku}] {item.title} ({item.acquisitionType})
+            </p>
+
+            <form onSubmit={handleSubmit} className="space-y-3 text-sm">
+              <div>
+                <label className="text-xs text-slate-400">UK Platform Fee Preset</label>
+                <select
+                  value={preset}
+                  onChange={(e) => handlePresetChange(e.target.value)}
+                  className="w-full mt-1 bg-slate-950 border border-indigo-500/40 rounded-lg px-3 py-2 text-xs text-indigo-200 font-medium"
+                >
+                  {Object.entries(UK_PLATFORM_PRESETS).map(([key, cfg]) => (
+                    <option key={key} value={key}>
+                      {cfg.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-400">Gross Sale Price (£) *</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    required
+                    value={gross}
+                    onChange={(e) => handleGrossChange(e.target.value)}
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400">Shipping Charged to Buyer (£)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={shippingCharged}
+                    onChange={(e) => handleShippingChange(e.target.value)}
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400">
+                    Platform Fee (£) {preset !== "CUSTOM" && "(Auto)"}
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={platformFee}
+                    onChange={(e) => {
+                      setPreset("CUSTOM");
+                      setPlatformFee(e.target.value);
+                    }}
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300 font-semibold"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400">Actual Postage Cost (£)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={actualPostage}
+                    onChange={(e) => setActualPostage(e.target.value)}
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400">Packaging Cost (£)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={packagingCost}
+                    onChange={(e) => setPackagingCost(e.target.value)}
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400">Buyer Username</label>
+                  <input
+                    type="text"
+                    value={buyerUsername}
+                    onChange={(e) => setBuyerUsername(e.target.value)}
+                    placeholder="e.g. collector_uk88"
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                  />
+                </div>
+              </div>
+
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-1.5 text-xs">
+                <div className="flex justify-between text-slate-400">
+                  <span>Net Profit After Fees & P&P:</span>
+                  <span className="font-bold text-white">{fmtGBP(splitPreview.netProfit)}</span>
+                </div>
+                <div className="flex justify-between text-indigo-300">
+                  <span>Consignee 60% Payout:</span>
+                  <span className="font-bold">{fmtGBP(splitPreview.consigneePayoutAmount)}</span>
+                </div>
+                <div className="flex justify-between text-emerald-300">
+                  <span>Your Business Share ({item.acquisitionType === "CONSIGNMENT" ? "40%" : "100%"}):</span>
+                  <span className="font-bold">{fmtGBP(splitPreview.businessProfitShare)}</span>
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="px-4 py-2 rounded-lg text-xs text-slate-400 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium px-4 py-2 rounded-lg"
+                >
+                  Confirm Sale & Log Cash-Flow
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      );
+    }
+    // ==========================================
+    // 9. MAIN APP STATE & HANDLERS
+    // ==========================================
+    function App() {
+      const [activePin, setActivePin] = useState(() => {
+        try {
+          return localStorage.getItem(PIN_STORAGE_KEY) || MASTER_PIN;
+        } catch {
+          return MASTER_PIN;
+        }
+      });
+
+      const [isUnlocked, setIsUnlocked] = useState(() => {
+        try {
+          return sessionStorage.getItem(SESSION_UNLOCK_KEY) === "true";
+        } catch {
+          return false;
+        }
+      });
+
+      const handleUnlockSuccess = () => {
+        setIsUnlocked(true);
+        try {
+          sessionStorage.setItem(SESSION_UNLOCK_KEY, "true");
+        } catch {}
+      };
+
+      const handleLockApp = () => {
+        setIsUnlocked(false);
+        try {
+          sessionStorage.removeItem(SESSION_UNLOCK_KEY);
+        } catch {}
+      };
+
+      const handleChangePin = () => {
+        const currentInput = prompt("Enter your current PIN:");
+        if (currentInput === null) return;
+        if (currentInput !== activePin) {
+          alert("Incorrect current PIN.");
+          return;
+        }
+        const newPin = prompt("Enter a new 4 to 6 digit numeric PIN:", "");
+        if (!newPin || !/^\d{4,6}$/.test(newPin.trim())) {
+          alert("PIN must be 4 to 6 digits (numbers only).");
+          return;
+        }
+        const cleanPin = newPin.trim();
+        setActivePin(cleanPin);
+        try {
+          localStorage.setItem(PIN_STORAGE_KEY, cleanPin);
+        } catch {}
+        alert("PIN updated successfully!");
+      };
+
+      const [db, setDb] = useState(() => {
+        try {
+          const saved = localStorage.getItem(STORAGE_KEY);
+          return saved ? JSON.parse(saved) : INITIAL_DATA;
+        } catch {
+          return INITIAL_DATA;
+        }
+      });
+
+      useEffect(() => {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+        } catch (e) {
+          console.error("Failed to save state", e);
+        }
+      }, [db]);
+
+      const [activeTab, setActiveTab] = useState("DASHBOARD");
+      const [taxEntityMode, setTaxEntityMode] = useState("SOLE_TRADER");
+
+      // Modals State
+      const [showAddStockModal, setShowAddStockModal] = useState(false);
+      const [showEbayImportModal, setShowEbayImportModal] = useState(false);
+      const [saleModalItem, setSaleModalItem] = useState(null);
+      const [showAddConsigneeModal, setShowAddConsigneeModal] = useState(false);
+      const [showAddExpenseModal, setShowAddExpenseModal] = useState(false);
+      const [statementModalPayout, setStatementModalPayout] = useState(null);
+      const [labelModalItems, setLabelModalItems] = useState(null);
+      const [editingItem, setEditingItem] = useState(null);
+
+      // Inventory Filters
+      const [stockFilterType, setStockFilterType] = useState("ALL");
+      const [stockFilterStatus, setStockFilterStatus] = useState("ALL");
+      const [searchQuery, setSearchQuery] = useState("");
+
+      // Live Sandbox Calculator State
+      const [calcType, setCalcType] = useState("CONSIGNMENT");
+      const [calcPlatformPreset, setCalcPlatformPreset] = useState("EBAY");
+      const [calcGross, setCalcGross] = useState(250);
+      const [calcShipCharged, setCalcShipCharged] = useState(6.95);
+      const [calcFee, setCalcFee] = useState(() => calculatePlatformFeeByPreset("EBAY", 250, 6.95));
+      const [calcPostage, setCalcPostage] = useState(6.45);
+      const [calcPack, setCalcPack] = useState(1.3);
+      const [calcCogs, setCalcCogs] = useState(110);
+
+      const handleSandboxPresetChange = (nextPreset) => {
+        setCalcPlatformPreset(nextPreset);
+        if (nextPreset !== "CUSTOM") {
+          setCalcFee(calculatePlatformFeeByPreset(nextPreset, calcGross, calcShipCharged));
+        }
+      };
+
+      const handleSandboxGrossChange = (val) => {
+        setCalcGross(val);
+        if (calcPlatformPreset !== "CUSTOM") {
+          setCalcFee(calculatePlatformFeeByPreset(calcPlatformPreset, val, calcShipCharged));
+        }
+      };
+
+      const handleSandboxShipChange = (val) => {
+        setCalcShipCharged(val);
+        if (calcPlatformPreset !== "CUSTOM") {
+          setCalcFee(calculatePlatformFeeByPreset(calcPlatformPreset, calcGross, val));
+        }
+      };
+
+      const sandboxResult = useMemo(
+        () =>
+          calculateSaleSplit({
+            acquisitionType: calcType,
+            grossSalePrice: calcGross,
+            shippingChargedToBuyer: calcShipCharged,
+            platformFeeAmount: calcFee,
+            actualPostageCost: calcPostage,
+            packagingCost: calcPack,
+            acquisitionCost: calcCogs,
+          }),
+        [calcType, calcGross, calcShipCharged, calcFee, calcPostage, calcPack, calcCogs]
+      );
+
+      // Deep Analytics & Financial Aggregations
+      const deepStats = useMemo(() => calculateDeepAnalytics(db), [db]);
+
+      const metrics = useMemo(() => {
+        let consignment40Profit = 0;
+        let owned100Profit = 0;
+        let unpaidConsignee60Liability = 0;
+
+        db.sales.forEach((s) => {
+          const item = db.inventory.find((i) => i.id === s.inventoryItemId);
+          if (item?.acquisitionType === "CONSIGNMENT") {
+            consignment40Profit += Number(s.businessProfitShare);
+            if (s.payoutStatus === "UNPAID") {
+              unpaidConsignee60Liability += Number(s.consigneePayoutAmount);
+            }
+          } else {
+            owned100Profit += Number(s.businessProfitShare);
+          }
+        });
+
+        const deductibleOverheads = db.expenses
+          .filter((e) => e.isTaxDeductible && !e.allocatedToItemSale)
+          .reduce((acc, e) => acc + Number(e.amount), 0);
+
+        const cashIngoings = db.cashFlow
+          .filter((c) => c.type === "INGOING")
+          .reduce((acc, c) => acc + Number(c.amount), 0);
+
+        const cashOutgoings = db.cashFlow
+          .filter((c) => c.type === "OUTGOING")
+          .reduce((acc, c) => acc + Number(c.amount), 0);
+
+        const totalBusinessSaleProfit = consignment40Profit + owned100Profit;
+        const taxBreakdown = calculateUkTaxLiability(
+          totalBusinessSaleProfit,
+          deductibleOverheads,
+          taxEntityMode
+        );
+
+        return {
+          consignment40Profit: toGbp(consignment40Profit * 100),
+          owned100Profit: toGbp(owned100Profit * 100),
+          unpaidConsignee60Liability: toGbp(unpaidConsignee60Liability * 100),
+          deductibleOverheads: toGbp(deductibleOverheads * 100),
+          cashIngoings: toGbp(cashIngoings * 100),
+          cashOutgoings: toGbp(cashOutgoings * 100),
+          netCashFlow: toGbp((cashIngoings - cashOutgoings) * 100),
+          taxBreakdown,
+        };
+      }, [db, taxEntityMode]);
+
+      // Bulk eBay CSV Import Handler with Duplicate Prevention
+      function handleBulkEbayImport(rows, fileName) {
+        const newInventory = [...db.inventory];
+        const newSales = [...db.sales];
+        const newCashFlow = [...db.cashFlow];
+        const newDocs = [...db.documents];
+        const today = new Date().toISOString().split("T")[0];
+
+        rows.forEach((r, idx) => {
+          const isConsignment = r.acquisitionType === "CONSIGNMENT";
+
+          if (r.mode === "STOCK") {
+            const existingIdx = newInventory.findIndex(
+              (i) => i.sku.toUpperCase() === r.sku.toUpperCase() || (r.platformItemId && i.platformItemId === r.platformItemId)
+            );
+            if (existingIdx !== -1) {
+              newInventory[existingIdx] = {
+                ...newInventory[existingIdx],
+                listedPrice: Number(r.listedPrice),
+                title: r.title,
+                condition: r.condition,
+              };
+            } else {
+              newInventory.unshift({
+                id: `inv-eb-${Date.now()}-${idx}`,
+                sku: r.sku,
+                title: r.title,
+                category: r.category,
+                acquisitionType: r.acquisitionType,
+                consigneeId: isConsignment ? r.consigneeId : null,
+                acquisitionCost: isConsignment ? 0 : Number(r.acquisitionCost || 0),
+                condition: r.condition,
+                storageLocation: "eBay Vault",
+                listedPrice: Number(r.listedPrice),
+                status: "ACTIVE",
+                platform: "EBAY",
+                platformItemId: r.platformItemId,
+                createdAt: today,
+              });
+            }
+          } else {
+            let matchedInvIdx = newInventory.findIndex(
+              (i) => i.sku.toUpperCase() === r.sku.toUpperCase() || (r.platformItemId && i.platformItemId === r.platformItemId)
+            );
+
+            let invId;
+            if (matchedInvIdx !== -1) {
+              invId = newInventory[matchedInvIdx].id;
+              newInventory[matchedInvIdx] = {
+                ...newInventory[matchedInvIdx],
+                status: isConsignment ? "PAYOUT_PENDING" : "COMPLETED",
+              };
+            } else {
+              invId = `inv-eb-sale-${Date.now()}-${idx}`;
+              newInventory.unshift({
+                id: invId,
+                sku: r.sku,
+                title: r.title,
+                category: r.category,
+                acquisitionType: r.acquisitionType,
+                consigneeId: isConsignment ? r.consigneeId : null,
+                acquisitionCost: isConsignment ? 0 : Number(r.acquisitionCost || 0),
+                condition: r.condition,
+                storageLocation: "Dispatched",
+                listedPrice: Number(r.grossSalePrice),
+                status: isConsignment ? "PAYOUT_PENDING" : "COMPLETED",
+                platform: "EBAY",
+                platformItemId: r.platformItemId,
+                createdAt: r.saleDate,
+              });
+            }
+
+            const split = calculateSaleSplit({
+              acquisitionType: r.acquisitionType,
+              grossSalePrice: r.grossSalePrice,
+              shippingChargedToBuyer: r.shippingChargedToBuyer,
+              platformFeeAmount: r.platformFeeAmount,
+              actualPostageCost: r.actualPostageCost,
+              packagingCost: r.packagingCost,
+              acquisitionCost: r.acquisitionCost,
+              consigneeSplitPercentage: 60,
+            });
+
+            const saleId = `sale-eb-${Date.now()}-${idx}`;
+            newSales.unshift({
+              id: saleId,
+              inventoryItemId: invId,
+              saleDate: r.saleDate,
+              buyerUsername: r.buyerUsername,
+              grossSalePrice: Number(r.grossSalePrice),
+              shippingChargedToBuyer: Number(r.shippingChargedToBuyer),
+              platformFeeAmount: Number(r.platformFeeAmount),
+              actualPostageCost: Number(r.actualPostageCost),
+              packagingCost: Number(r.packagingCost),
+              ownedStockCogs: isConsignment ? 0 : Number(r.acquisitionCost || 0),
+              netProfit: split.netProfit,
+              businessProfitShare: split.businessProfitShare,
+              consigneePayoutAmount: split.consigneePayoutAmount,
+              payoutStatus: isConsignment ? "UNPAID" : "NOT_APPLICABLE",
+              payoutId: null,
+            });
+
+            newCashFlow.unshift({
+              id: `cf-eb-in-${Date.now()}-${idx}`,
+              entryDate: r.saleDate,
+              type: "INGOING",
+              source: "SALE_GROSS_RECEIPT",
+              amount: split.totalIngoing,
+              description: `eBay CSV Gross Receipt: [${r.sku}] ${r.title}`,
+              saleRecordId: saleId,
+            });
+
+            const directOut = toGbp(
+              toPence(r.platformFeeAmount) + toPence(r.actualPostageCost) + toPence(r.packagingCost)
+            );
+            if (directOut > 0) {
+              newCashFlow.unshift({
+                id: `cf-eb-out-${Date.now()}-${idx}`,
+                entryDate: r.saleDate,
+                type: "OUTGOING",
+                source: "PLATFORM_FEE_DEDUCTION",
+                amount: directOut,
+                description: `eBay CSV Fees & P&P: [${r.sku}]`,
+                saleRecordId: saleId,
+              });
+            }
+          }
+        });
+
+        if (fileName) {
+          newDocs.unshift({
+            id: "doc-eb-" + Date.now(),
+            fileName,
+            documentType: "EBAY_CSV_REPORT",
+            linkedTo: `Bulk Import (${rows.length} rows)`,
+            fileSize: "142 KB",
+            uploadedAt: today,
+          });
+        }
+
+        setDb({
+          ...db,
+          inventory: newInventory,
+          sales: newSales,
+          cashFlow: newCashFlow,
+          documents: newDocs,
+        });
+        setShowEbayImportModal(false);
+      }
+      // ==========================================
+      // 10. STANDARD CRUD, VOID SALE & EXPORT HANDLERS
+      // ==========================================
+      function handleAddStock(e) {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const acquisitionType = fd.get("acquisitionType");
+        const consigneeId = acquisitionType === "CONSIGNMENT" ? fd.get("consigneeId") : null;
+        const acquisitionCost = acquisitionType === "OWNED_STOCK" ? Number(fd.get("acquisitionCost") || 0) : 0;
+
+        if (acquisitionType === "CONSIGNMENT" && !consigneeId) {
+          alert("Please select a Consignee for Consignment stock.");
+          return;
+        }
+
+        const today = new Date().toISOString().split("T")[0];
+        const newItem = {
+          id: "inv-" + Date.now(),
+          sku: fd.get("sku").toUpperCase().trim(),
+          title: fd.get("title").trim(),
+          category: fd.get("category"),
+          acquisitionType,
+          consigneeId,
+          acquisitionCost,
+          condition: fd.get("condition").trim(),
+          storageLocation: fd.get("storageLocation").trim() || "Vault A-01",
+          listedPrice: Number(fd.get("listedPrice")),
+          status: "ACTIVE",
+          platform: fd.get("platform") || "EBAY",
+          platformItemId: fd.get("platformItemId")?.trim() || "N/A",
+          createdAt: today,
+        };
+
+        const newCashFlow = [...db.cashFlow];
+        if (acquisitionType === "OWNED_STOCK" && acquisitionCost > 0) {
+          newCashFlow.unshift({
+            id: "cf-" + Date.now(),
+            entryDate: today,
+            type: "OUTGOING",
+            source: "OWNED_STOCK_ACQUISITION",
+            amount: acquisitionCost,
+            description: `COGS Acquisition: [${newItem.sku}] ${newItem.title}`,
+          });
+        }
+
+        setDb({ ...db, inventory: [newItem, ...db.inventory], cashFlow: newCashFlow });
+        setShowAddStockModal(false);
+      }
+
+      function handleEditStockSave(e) {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const updatedPrice = Number(fd.get("listedPrice"));
+        const updatedBin = fd.get("storageLocation").trim();
+        const updatedCondition = fd.get("condition").trim();
+        const updatedPlatform = fd.get("platform");
+        const updatedTitle = fd.get("title").trim();
+
+        setDb({
+          ...db,
+          inventory: db.inventory.map((i) =>
+            i.id === editingItem.id
+              ? {
+                  ...i,
+                  title: updatedTitle,
+                  listedPrice: updatedPrice,
+                  storageLocation: updatedBin,
+                  condition: updatedCondition,
+                  platform: updatedPlatform,
+                }
+              : i
+          ),
+        });
+        setEditingItem(null);
+      }
+
+      function handleConfirmRecordSale(saleData) {
+        const {
+          grossSalePrice,
+          shippingChargedToBuyer,
+          platformFeeAmount,
+          actualPostageCost,
+          packagingCost,
+          buyerUsername,
+          proofFileName,
+        } = saleData;
+
+        const consignee = db.consignees.find((c) => c.id === saleModalItem.consigneeId);
+        const split = calculateSaleSplit({
+          acquisitionType: saleModalItem.acquisitionType,
+          grossSalePrice,
+          shippingChargedToBuyer,
+          platformFeeAmount,
+          actualPostageCost,
+          packagingCost,
+          acquisitionCost: saleModalItem.acquisitionCost,
+          consigneeSplitPercentage: consignee ? Number(consignee.defaultSplit) : 60,
+        });
+
+        const isConsignment = saleModalItem.acquisitionType === "CONSIGNMENT";
+        const today = new Date().toISOString().split("T")[0];
+        const saleId = "sale-" + Date.now();
+
+        const newSale = {
+          id: saleId,
+          inventoryItemId: saleModalItem.id,
+          saleDate: today,
+          buyerUsername,
+          grossSalePrice,
+          shippingChargedToBuyer,
+          platformFeeAmount,
+          actualPostageCost,
+          packagingCost,
+          ownedStockCogs: isConsignment ? 0 : Number(saleModalItem.acquisitionCost),
+          netProfit: split.netProfit,
+          businessProfitShare: split.businessProfitShare,
+          consigneePayoutAmount: split.consigneePayoutAmount,
+          payoutStatus: isConsignment ? "UNPAID" : "NOT_APPLICABLE",
+          payoutId: null,
+        };
+
+        const updatedInventory = db.inventory.map((item) =>
+          item.id === saleModalItem.id
+            ? { ...item, status: isConsignment ? "PAYOUT_PENDING" : "COMPLETED" }
+            : item
+        );
+
+        const newCashFlow = [
+          {
+            id: "cf-in-" + Date.now(),
+            entryDate: today,
+            type: "INGOING",
+            source: "SALE_GROSS_RECEIPT",
+            amount: split.totalIngoing,
+            description: `Gross Receipt: [${saleModalItem.sku}] ${saleModalItem.title}`,
+            saleRecordId: saleId,
+          },
+          ...db.cashFlow,
+        ];
+
+        const directOutgoings = toGbp(
+          toPence(platformFeeAmount) + toPence(actualPostageCost) + toPence(packagingCost)
+        );
+        if (directOutgoings > 0) {
+          newCashFlow.unshift({
+            id: "cf-out-" + (Date.now() + 1),
+            entryDate: today,
+            type: "OUTGOING",
+            source: "PLATFORM_FEE_DEDUCTION",
+            amount: directOutgoings,
+            description: `Fees, Postage & Packaging: [${saleModalItem.sku}]`,
+            saleRecordId: saleId,
+          });
+        }
+
+        const newDocs = [...db.documents];
+        if (proofFileName) {
+          newDocs.unshift({
+            id: "doc-" + Date.now(),
+            fileName: proofFileName,
+            documentType: "PROOF_OF_POSTAGE",
+            linkedTo: `Sale: ${saleModalItem.sku} (${fmtGBP(actualPostageCost)})`,
+            fileSize: "410 KB",
+            uploadedAt: today,
+          });
+        }
+
+        setDb({
+          ...db,
+          inventory: updatedInventory,
+          sales: [newSale, ...db.sales],
+          cashFlow: newCashFlow,
+          documents: newDocs,
+        });
+        setSaleModalItem(null);
+      }
+
+      function handleVoidSale(saleId) {
+        const targetSale = db.sales.find((s) => s.id === saleId);
+        if (!targetSale) return;
+        if (targetSale.payoutStatus === "PAID") {
+          alert("This sale has already been settled in a Consignee Payout batch and cannot be voided.");
+          return;
+        }
+        const item = db.inventory.find((i) => i.id === targetSale.inventoryItemId);
+        if (
+          !confirm(
+            `Void & Refund sale of [${item?.sku || "Item"}]?\nThis will restore the item to ACTIVE stock and remove its sale & fee cash-flow entries.`
+          )
+        ) {
+          return;
+        }
+
+        setDb({
+          ...db,
+          sales: db.sales.filter((s) => s.id !== saleId),
+          inventory: db.inventory.map((i) =>
+            i.id === targetSale.inventoryItemId ? { ...i, status: "ACTIVE" } : i
+          ),
+          cashFlow: db.cashFlow.filter((cf) => cf.saleRecordId !== saleId),
+        });
+      }
+
+      function handleSettleConsigneePayout(consigneeId) {
+        const consignee = db.consignees.find((c) => c.id === consigneeId);
+        const unpaidSales = db.sales.filter((s) => {
+          const item = db.inventory.find((i) => i.id === s.inventoryItemId);
+          return s.payoutStatus === "UNPAID" && item?.consigneeId === consigneeId;
+        });
+
+        if (unpaidSales.length === 0) return;
+
+        const paymentRef = prompt(
+          `Settle 60% Payout for ${consignee.name}?\nEnter UK Faster Payments Reference:`,
+          `FP-${Math.floor(100000 + Math.random() * 900000)}`
+        );
+        if (!paymentRef) return;
+
+        const totalPayout = toGbp(
+          unpaidSales.reduce((acc, s) => acc + toPence(s.consigneePayoutAmount), 0)
+        );
+        const today = new Date().toISOString().split("T")[0];
+        const payoutNumber = `PO-2026-${String(db.payouts.length + 101).padStart(4, "0")}`;
+
+        const lineItems = unpaidSales.map((s) => {
+          const item = db.inventory.find((i) => i.id === s.inventoryItemId);
+          return {
+            sku: item?.sku || "SKU",
+            title: item?.title || "Item",
+            saleDate: s.saleDate,
+            grossPlusShipping: toGbp(toPence(s.grossSalePrice) + toPence(s.shippingChargedToBuyer)),
+            deductions: toGbp(
+              toPence(s.platformFeeAmount) + toPence(s.actualPostageCost) + toPence(s.packagingCost)
+            ),
+            netProfit: s.netProfit,
+            consigneeShare60: s.consigneePayoutAmount,
+            businessShare40: s.businessProfitShare,
+          };
+        });
+
+        const newPayout = {
+          id: "po-" + Date.now(),
+          payoutNumber,
+          consigneeId,
+          consigneeName: consignee.name,
+          consigneeEmail: consignee.email,
+          consigneeBank: consignee.bankDetails,
+          totalPayoutAmount: totalPayout,
+          paidAt: today,
+          paymentReference: paymentRef,
+          items: lineItems,
+        };
+
+        const unpaidSaleIds = new Set(unpaidSales.map((s) => s.id));
+        const unpaidItemIds = new Set(unpaidSales.map((s) => s.inventoryItemId));
+
+        setDb({
+          ...db,
+          sales: db.sales.map((s) =>
+            unpaidSaleIds.has(s.id) ? { ...s, payoutStatus: "PAID", payoutId: newPayout.id } : s
+          ),
+          inventory: db.inventory.map((i) =>
+            unpaidItemIds.has(i.id) ? { ...i, status: "COMPLETED" } : i
+          ),
+          payouts: [newPayout, ...db.payouts],
+          cashFlow: [
+            {
+              id: "cf-po-" + Date.now(),
+              entryDate: today,
+              type: "OUTGOING",
+              source: "CONSIGNEE_PAYOUT",
+              amount: totalPayout,
+              description: `Consignee 60% Payout ${payoutNumber} to ${consignee.name} (Ref: ${paymentRef})`,
+            },
+            ...db.cashFlow,
+          ],
+          documents: [
+            {
+              id: "doc-po-" + Date.now(),
+              fileName: `${payoutNumber}-${consignee.name.toLowerCase().replace(/\s+/g, "-")}.pdf`,
+              documentType: "PAYOUT_STATEMENT_PDF",
+              linkedTo: `Payout: ${payoutNumber}`,
+              fileSize: "164 KB",
+              uploadedAt: today,
+            },
+            ...db.documents,
+          ],
+        });
+
+        setStatementModalPayout(newPayout);
+      }
+
+      function handleAddConsignee(e) {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const today = new Date().toISOString().split("T")[0];
+        const newConsignee = {
+          id: "con-" + Date.now(),
+          name: fd.get("name").trim(),
+          email: fd.get("email").trim(),
+          phone: fd.get("phone")?.trim() || "",
+          address: fd.get("address")?.trim() || "",
+          bankDetails: fd.get("bankDetails").trim(),
+          defaultSplit: Number(fd.get("defaultSplit") || 60),
+          notes: fd.get("notes")?.trim() || "",
+        };
+
+        const agreementFile = fd.get("agreementFile")?.name;
+        const newDocs = [...db.documents];
+        if (agreementFile) {
+          newDocs.unshift({
+            id: "doc-con-" + Date.now(),
+            fileName: agreementFile,
+            documentType: "CONSIGNMENT_AGREEMENT",
+            linkedTo: `Consignee: ${newConsignee.name}`,
+            fileSize: "215 KB",
+            uploadedAt: today,
+          });
+        }
+
+        setDb({ ...db, consignees: [...db.consignees, newConsignee], documents: newDocs });
+        setShowAddConsigneeModal(false);
+      }
+
+      function handleAddExpense(e) {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const amount = Number(fd.get("amount"));
+        const expenseDate = fd.get("expenseDate") || new Date().toISOString().split("T")[0];
+        const merchant = fd.get("merchant").trim();
+        const description = fd.get("description").trim();
+        const category = fd.get("category") || "OTHER";
+        const allocatedToItemSale = fd.get("allocatedToItemSale") === "on";
+        const receiptFile = fd.get("receiptFile")?.name || "expense-receipt.pdf";
+
+        setDb({
+          ...db,
+          expenses: [
+            {
+              id: "exp-" + Date.now(),
+              expenseDate,
+              category,
+              merchant,
+              description,
+              amount,
+              isTaxDeductible: true,
+              allocatedToItemSale,
+              receiptName: receiptFile,
+            },
+            ...db.expenses,
+          ],
+          cashFlow: [
+            {
+              id: "cf-exp-" + Date.now(),
+              entryDate: expenseDate,
+              type: "OUTGOING",
+              source: "OPERATING_EXPENSE",
+              amount,
+              description: `${merchant} — ${description}`,
+            },
+            ...db.cashFlow,
+          ],
+          documents: [
+            {
+              id: "doc-exp-" + Date.now(),
+              fileName: receiptFile,
+              documentType: "EXPENSE_RECEIPT",
+              linkedTo: `Expense: ${merchant} (${fmtGBP(amount)})`,
+              fileSize: "184 KB",
+              uploadedAt: expenseDate,
+            },
+            ...db.documents,
+          ],
+        });
+        setShowAddExpenseModal(false);
+      }
+
+      function downloadUkAccountantCsv() {
+        const headers = [
+          "Sale Date",
+          "SKU",
+          "Item Title",
+          "Acquisition Type",
+          "Consignee Name",
+          "Gross Sale (GBP)",
+          "Shipping Charged (GBP)",
+          "Platform Fees (GBP)",
+          "Actual Postage (GBP)",
+          "Packaging Cost (GBP)",
+          "Owned Stock COGS (GBP)",
+          "Item True Net Profit (GBP)",
+          "Consignee 60% Payout (GBP)",
+          "Taxable Business Profit Share (GBP)",
+          "Payout Status",
+        ];
+
+        const rows = db.sales.map((s) => {
+          const item = db.inventory.find((i) => i.id === s.inventoryItemId);
+          const consignee = db.consignees.find((c) => c.id === item?.consigneeId);
+          return [
+            s.saleDate,
+            item?.sku || "",
+            `"${(item?.title || "").replace(/"/g, '""')}"`,
+            item?.acquisitionType || "",
+            `"${consignee ? consignee.name : "N/A - Owned Stock"}"`,
+            Number(s.grossSalePrice).toFixed(2),
+            Number(s.shippingChargedToBuyer).toFixed(2),
+            Number(s.platformFeeAmount).toFixed(2),
+            Number(s.actualPostageCost).toFixed(2),
+            Number(s.packagingCost).toFixed(2),
+            Number(s.ownedStockCogs).toFixed(2),
+            Number(s.netProfit).toFixed(2),
+            Number(s.consigneePayoutAmount).toFixed(2),
+            Number(s.businessProfitShare).toFixed(2),
+            s.payoutStatus,
+          ];
+        });
+
+        const csvContent = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
+        const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `tpcg-uk-tax-export-${new Date().toISOString().slice(0, 10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      function exportDatabaseBackupJson() {
+        const blob = new Blob([JSON.stringify(db, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `tpcg-full-backup-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      function importDatabaseBackupJson(e) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+          try {
+            const parsed = JSON.parse(evt.target.result);
+            if (parsed.inventory && parsed.sales) {
+              setDb(parsed);
+              alert("Backup restored successfully!");
+            }
+          } catch {
+            alert("Invalid JSON backup file.");
+          }
+        };
+        reader.readAsText(file);
+      }
+
+      function resetDemoData() {
+        if (confirm("Reset all records back to the original demo dataset?")) {
+          setDb(INITIAL_DATA);
+        }
+      }
+
+      const filteredInventory = useMemo(() => {
+        return db.inventory.filter((item) => {
+          if (stockFilterType !== "ALL" && item.acquisitionType !== stockFilterType) return false;
+          if (stockFilterStatus !== "ALL" && item.status !== stockFilterStatus) return false;
+          if (
+            searchQuery &&
+            !item.title.toLowerCase().includes(searchQuery.toLowerCase()) &&
+            !item.sku.toLowerCase().includes(searchQuery.toLowerCase()) &&
+            !(item.storageLocation || "").toLowerCase().includes(searchQuery.toLowerCase())
+          ) {
+            return false;
+          }
+          return true;
+        });
+      }, [db.inventory, stockFilterType, stockFilterStatus, searchQuery]);
+
+      if (!isUnlocked) {
+        return <PinLockScreen activePin={activePin} onUnlock={handleUnlockSuccess} />;
+      }
+
+      return (
+        <div className="min-h-screen flex flex-col">
+          {/* TOP HEADER */}
+          <header className="bg-slate-900/90 border-b border-slate-800 sticky top-0 z-30 backdrop-blur no-print">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3.5 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center font-black text-lg text-white shadow-lg shadow-indigo-600/30">
+                    TPG
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h1 className="text-lg sm:text-xl font-bold tracking-tight text-white">
+                        That Pop Culture Guy
+                      </h1>
+                      <button
+                        onClick={() => setShowEbayImportModal(true)}
+                        className="px-2.5 py-0.5 text-[11px] font-semibold rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition"
+                      >
+                        📥 Import eBay CSV
+                      </button>
+                    </div>
+                    <p className="text-xs text-slate-400">
+                      eBay Auto-Importer • Deep BI Analytics • 60/40 Split & UK HMRC Tax
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex lg:hidden items-center gap-1.5">
+                  <button
+                    onClick={handleChangePin}
+                    className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-slate-800 text-slate-300 border border-slate-700"
+                  >
+                    PIN
+                  </button>
+                  <button
+                    onClick={handleLockApp}
+                    className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30"
+                  >
+                    🔒 Lock
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <nav className="flex flex-wrap items-center gap-1 bg-slate-950 p-1.5 rounded-xl border border-slate-800">
+                  {[
+                    { id: "DASHBOARD", label: "Dashboard" },
+                    { id: "ANALYTICS", label: "📊 Deep Analytics" },
+                    { id: "INVENTORY", label: `Stock (${db.inventory.length})` },
+                    { id: "SALES", label: `Sales (${db.sales.length})` },
+                    { id: "CONSIGNEES", label: "Consignees" },
+                    { id: "EXPENSES", label: "Cash-Flow" },
+                    { id: "TAX_DOCS", label: "UK Tax & Docs" },
+                  ].map((tab) => (
+                    <button
+                      key={tab.id}
+                      onClick={() => setActiveTab(tab.id)}
+                      className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition ${
+                        activeTab === tab.id
+                          ? "bg-indigo-600 text-white shadow"
+                          : "text-slate-400 hover:text-white hover:bg-slate-900"
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </nav>
+
+                <div className="hidden lg:flex items-center gap-2">
+                  <button
+                    onClick={handleChangePin}
+                    className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700"
+                  >
+                    PIN
+                  </button>
+                  <button
+                    onClick={handleLockApp}
+                    className="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30"
+                  >
+                    🔒 Lock
+                  </button>
+                </div>
+              </div>
+            </div>
+          </header>
+
+          {/* MAIN WORKSPACE */}
+          <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 no-print">
+            {/* TOP KPI RIBBON */}
+            <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span>Taxable Net Business Profit</span>
+                  <span className="text-emerald-400 font-semibold">HMRC Basis</span>
+                </div>
+                <p className="text-2xl font-bold text-white mt-1.5">
+                  {fmtGBP(metrics.taxBreakdown.taxableNetProfit)}
+                </p>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  40% Consign ({fmtGBP(metrics.consignment40Profit)}) + 100% Owned (
+                  {fmtGBP(metrics.owned100Profit)}) - Overheads ({fmtGBP(metrics.deductibleOverheads)})
+                </p>
+              </div>
+
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span>Est. UK Tax Reserve ({taxEntityMode === "SOLE_TRADER" ? "Sole Trader" : "Ltd Co"})</span>
+                  <button
+                    onClick={() =>
+                      setTaxEntityMode(taxEntityMode === "SOLE_TRADER" ? "LIMITED_COMPANY" : "SOLE_TRADER")
+                    }
+                    className="text-indigo-400 hover:underline text-[11px]"
+                  >
+                    Switch Mode
+                  </button>
+                </div>
+                <p className="text-2xl font-bold text-amber-400 mt-1.5">
+                  {fmtGBP(metrics.taxBreakdown.totalEstimatedTaxLiability)}
+                </p>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Effective Rate: {metrics.taxBreakdown.effectiveTaxRatePercent}% • Net After Tax:{" "}
+                  {fmtGBP(metrics.taxBreakdown.netProfitAfterTax)}
+                </p>
+              </div>
+
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span>Unpaid Consignee Liability (60%)</span>
+                  <span className="text-indigo-400 font-semibold">Ring-Fenced</span>
+                </div>
+                <p className="text-2xl font-bold text-indigo-300 mt-1.5">
+                  {fmtGBP(metrics.unpaidConsignee60Liability)}
+                </p>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Across {db.sales.filter((s) => s.payoutStatus === "UNPAID").length} unpaid consignment sales
+                </p>
+              </div>
+
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span>Active Portfolio Retail Value</span>
+                  <span className="text-sky-400 font-semibold">Est. Share: {fmtGBP(deepStats.projectedActiveBusinessProfit)}</span>
+                </div>
+                <p className="text-2xl font-bold text-sky-300 mt-1.5">
+                  {fmtGBP(deepStats.activePortfolioValue)}
+                </p>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Consigned: {fmtGBP(deepStats.activeConsignedValue)} • Owned: {fmtGBP(deepStats.activeOwnedRetailValue)}
+                </p>
+              </div>
+            </section>
+
+            {/* ==========================================
+                TAB 1: DASHBOARD
+               ========================================== */}
+            {activeTab === "DASHBOARD" && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-5">
+                  <div className="flex items-center justify-between mb-3">
+                    <div>
+                      <h2 className="text-base font-bold text-white">Live 60/40 Profit-Split Calculator</h2>
+                      <p className="text-xs text-slate-400">Auto-calculates UK platform fees & 60/40 split</p>
+                    </div>
+                    <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs">
+                      <button
+                        onClick={() => setCalcType("CONSIGNMENT")}
+                        className={`px-2.5 py-1 rounded ${
+                          calcType === "CONSIGNMENT" ? "bg-indigo-600 text-white" : "text-slate-400"
+                        }`}
+                      >
+                        Consignment
+                      </button>
+                      <button
+                        onClick={() => setCalcType("OWNED_STOCK")}
+                        className={`px-2.5 py-1 rounded ${
+                          calcType === "OWNED_STOCK" ? "bg-emerald-600 text-white" : "text-slate-400"
+                        }`}
+                      >
+                        Owned Stock
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mb-3">
+                    <label className="text-xs text-slate-400">UK Sales Channel Fee Preset</label>
+                    <select
+                      value={calcPlatformPreset}
+                      onChange={(e) => handleSandboxPresetChange(e.target.value)}
+                      className="w-full mt-1 bg-slate-950 border border-indigo-500/40 rounded-lg px-3 py-2 text-xs text-indigo-200 font-medium"
+                    >
+                      {Object.entries(UK_PLATFORM_PRESETS).map(([key, cfg]) => (
+                        <option key={key} value={key}>
+                          {cfg.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div>
+                      <label className="text-xs text-slate-400">Gross Sale Price (£)</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={calcGross}
+                        onChange={(e) => handleSandboxGrossChange(e.target.value)}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-400">Shipping Charged (£)</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={calcShipCharged}
+                        onChange={(e) => handleSandboxShipChange(e.target.value)}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-400">
+                        Platform Fee (£) {calcPlatformPreset !== "CUSTOM" && "(Auto)"}
+                      </label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={calcFee}
+                        onChange={(e) => {
+                          setCalcPlatformPreset("CUSTOM");
+                          setCalcFee(e.target.value);
+                        }}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300 font-semibold"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-400">Actual Postage Cost (£)</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={calcPostage}
+                        onChange={(e) => setCalcPostage(e.target.value)}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-400">Packaging Cost (£)</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={calcPack}
+                        onChange={(e) => setCalcPack(e.target.value)}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300"
+                      />
+                    </div>
+                    {calcType === "OWNED_STOCK" && (
+                      <div>
+                        <label className="text-xs text-slate-400">Owned Stock COGS (£)</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={calcCogs}
+                          onChange={(e) => setCalcCogs(e.target.value)}
+                          className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-amber-300"
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="mt-4 bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-2 text-sm">
+                    <div className="flex justify-between text-xs text-slate-400">
+                      <span>Total Ingoing (Gross + Shipping)</span>
+                      <span className="text-slate-200">{fmtGBP(sandboxResult.totalIngoing)}</span>
+                    </div>
+                    <div className="flex justify-between text-xs text-slate-400">
+                      <span>Direct Deductions</span>
+                      <span className="text-rose-400">-{fmtGBP(sandboxResult.totalDirectCosts)}</span>
+                    </div>
+                    <div className="border-t border-slate-800 pt-2 flex justify-between font-bold text-white">
+                      <span>True Net Profit</span>
+                      <span>{fmtGBP(sandboxResult.netProfit)}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3 pt-2">
+                      <div className="bg-indigo-950/40 border border-indigo-500/30 rounded-lg p-3">
+                        <span className="text-[11px] text-indigo-300 block">
+                          Consignee Share ({calcType === "CONSIGNMENT" ? "60%" : "0%"})
+                        </span>
+                        <span className="text-lg font-bold text-indigo-200">
+                          {fmtGBP(sandboxResult.consigneePayoutAmount)}
+                        </span>
+                      </div>
+                      <div className="bg-emerald-950/40 border border-emerald-500/30 rounded-lg p-3">
+                        <span className="text-[11px] text-emerald-300 block">
+                          Business Share ({calcType === "CONSIGNMENT" ? "40%" : "100%"})
+                        </span>
+                        <span className="text-lg font-bold text-emerald-200">
+                          {fmtGBP(sandboxResult.businessProfitShare)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="lg:col-span-7 space-y-6">
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+                      <div>
+                        <h2 className="text-base font-bold text-white">Consignee Payout Queue (60% Split)</h2>
+                        <p className="text-xs text-slate-400">
+                          Settle unpaid consignment sales and generate PDF statements
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          onClick={() => setShowEbayImportModal(true)}
+                          className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold px-3 py-1.5 rounded-lg transition"
+                        >
+                          📥 Import eBay CSV
+                        </button>
+                        <button
+                          onClick={() => setShowAddStockModal(true)}
+                          className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition"
+                        >
+                          + Add Inventory
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-sm">
+                        <thead>
+                          <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase">
+                            <th className="py-2.5 px-2">Consignee</th>
+                            <th className="py-2.5 px-2">Unpaid Sales</th>
+                            <th className="py-2.5 px-2">Net Profit</th>
+                            <th className="py-2.5 px-2">60% Payout Due</th>
+                            <th className="py-2.5 px-2">Your 40%</th>
+                            <th className="py-2.5 px-2 text-right">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/60">
+                          {db.consignees.map((c) => {
+                            const unpaidSales = db.sales.filter((s) => {
+                              const item = db.inventory.find((i) => i.id === s.inventoryItemId);
+                              return s.payoutStatus === "UNPAID" && item?.consigneeId === c.id;
+                            });
+                            const totalNet = unpaidSales.reduce((a, s) => a + Number(s.netProfit), 0);
+                            const payout60 = unpaidSales.reduce((a, s) => a + Number(s.consigneePayoutAmount), 0);
+                            const business40 = unpaidSales.reduce((a, s) => a + Number(s.businessProfitShare), 0);
+
+                            return (
+                              <tr key={c.id} className="hover:bg-slate-800/30">
+                                <td className="py-3 px-2 font-medium text-white">
+                                  {c.name}
+                                  <span className="block text-[11px] text-slate-400">{c.bankDetails}</span>
+                                </td>
+                                <td className="py-3 px-2 text-slate-300">{unpaidSales.length} items</td>
+                                <td className="py-3 px-2 text-slate-300">{fmtGBP(totalNet)}</td>
+                                <td className="py-3 px-2 font-semibold text-indigo-300">{fmtGBP(payout60)}</td>
+                                <td className="py-3 px-2 font-semibold text-emerald-300">{fmtGBP(business40)}</td>
+                                <td className="py-3 px-2 text-right">
+                                  {unpaidSales.length > 0 ? (
+                                    <button
+                                      onClick={() => handleSettleConsigneePayout(c.id)}
+                                      className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition"
+                                    >
+                                      Settle & PDF
+                                    </button>
+                                  ) : (
+                                    <span className="text-xs text-slate-500">Settled</span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* Active Stock Ready to Sell */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-sm font-bold text-white">Active Stock Listed Across Channels</h3>
+                      <button
+                        onClick={() => setActiveTab("ANALYTICS")}
+                        className="text-xs text-indigo-400 hover:underline"
+                      >
+                        Explore Deep Analytics →
+                      </button>
+                    </div>
+                    <div className="space-y-2.5">
+                      {db.inventory
+                        .filter((i) => i.status === "ACTIVE")
+                        .slice(0, 5)
+                        .map((item) => {
+                          const consignee = db.consignees.find((c) => c.id === item.consigneeId);
+                          return (
+                            <div
+                              key={item.id}
+                              className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-950 border border-slate-800 rounded-lg p-3"
+                            >
+                              <div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-xs font-mono text-indigo-400">{item.sku}</span>
+                                  <span className="text-[10px] bg-slate-800 text-amber-300 px-2 py-0.5 rounded font-mono">
+                                    📍 {item.storageLocation || "Vault A-01"}
+                                  </span>
+                                  <span
+                                    className={`text-[10px] px-2 py-0.5 rounded font-semibold ${
+                                      item.acquisitionType === "CONSIGNMENT"
+                                        ? "bg-indigo-500/20 text-indigo-300"
+                                        : "bg-emerald-500/20 text-emerald-300"
+                                    }`}
+                                  >
+                                    {item.acquisitionType === "CONSIGNMENT"
+                                      ? `CONSIGNMENT (${consignee?.name})`
+                                      : `OWNED (COGS: ${fmtGBP(item.acquisitionCost)})`}
+                                  </span>
+                                </div>
+                                <p className="text-sm font-medium text-white mt-1">{item.title}</p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm font-bold text-white mr-1">
+                                  {fmtGBP(item.listedPrice)}
+                                </span>
+                                <button
+                                  onClick={() => setEditingItem(item)}
+                                  className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2.5 py-1.5 rounded-lg border border-slate-700"
+                                >
+                                  ✏️ Edit
+                                </button>
+                                <button
+                                  onClick={() => setLabelModalItems([item])}
+                                  className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-slate-700"
+                                >
+                                  🏷️ Label
+                                </button>
+                                <button
+                                  onClick={() => setSaleModalItem(item)}
+                                  className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg"
+                                >
+                                  Record Sale
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ==========================================
+                TAB 2: DEEP-DIVE ANALYTICS & BI ENGINE
+               ========================================== */}
+            {activeTab === "ANALYTICS" && (
+              <div className="space-y-6">
+                {/* Gross-to-Net Revenue Waterfall Bar */}
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+                    <div>
+                      <h2 className="text-base font-bold text-white">
+                        Gross Buyer Turnover Anatomy ({fmtGBP(deepStats.totalTopLineIngoing)} Total Ingoing)
+                      </h2>
+                      <p className="text-xs text-slate-400">
+                        Visual breakdown of where every £1 of buyer money goes across Fees, Postage/Pack, Owned COGS, Consignee 60% & Your Net Keep
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="w-full h-5 rounded-xl overflow-hidden flex bg-slate-950 border border-slate-800">
+                    <div
+                      style={{ width: `${deepStats.waterfall.businessKeepPct}%` }}
+                      className="bg-emerald-500 h-full"
+                      title={`Your Business Keep: ${deepStats.waterfall.businessKeepPct}%`}
+                    />
+                    <div
+                      style={{ width: `${deepStats.waterfall.consigneePct}%` }}
+                      className="bg-indigo-500 h-full"
+                      title={`Consignee 60% Share: ${deepStats.waterfall.consigneePct}%`}
+                    />
+                    <div
+                      style={{ width: `${deepStats.waterfall.cogsPct}%` }}
+                      className="bg-amber-500 h-full"
+                      title={`Owned Stock COGS: ${deepStats.waterfall.cogsPct}%`}
+                    />
+                    <div
+                      style={{ width: `${deepStats.waterfall.feesPct}%` }}
+                      className="bg-rose-500 h-full"
+                      title={`Platform Fees: ${deepStats.waterfall.feesPct}%`}
+                    />
+                    <div
+                      style={{ width: `${deepStats.waterfall.postagePackPct}%` }}
+                      className="bg-orange-400 h-full"
+                      title={`Postage & Packaging: ${deepStats.waterfall.postagePackPct}%`}
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3 text-xs">
+                    <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+                      <span className="inline-block w-2 h-2 rounded-full bg-emerald-500 mr-1.5" />
+                      <span className="text-slate-400">Your Keep ({deepStats.waterfall.businessKeepPct}%)</span>
+                      <p className="font-bold text-emerald-400 mt-0.5">{fmtGBP(deepStats.totalBusinessKeep)}</p>
+                    </div>
+                    <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+                      <span className="inline-block w-2 h-2 rounded-full bg-indigo-500 mr-1.5" />
+                      <span className="text-slate-400">Consignees ({deepStats.waterfall.consigneePct}%)</span>
+                      <p className="font-bold text-indigo-300 mt-0.5">{fmtGBP(deepStats.totalConsigneeShare)}</p>
+                    </div>
+                    <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+                      <span className="inline-block w-2 h-2 rounded-full bg-amber-500 mr-1.5" />
+                      <span className="text-slate-400">Owned COGS ({deepStats.waterfall.cogsPct}%)</span>
+                      <p className="font-bold text-amber-300 mt-0.5">{fmtGBP(deepStats.totalSoldOwnedCogs)}</p>
+                    </div>
+                    <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+                      <span className="inline-block w-2 h-2 rounded-full bg-rose-500 mr-1.5" />
+                      <span className="text-slate-400">Platform Fees ({deepStats.waterfall.feesPct}%)</span>
+                      <p className="font-bold text-rose-400 mt-0.5">{fmtGBP(deepStats.totalPlatformFees)}</p>
+                    </div>
+                    <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+                      <span className="inline-block w-2 h-2 rounded-full bg-orange-400 mr-1.5" />
+                      <span className="text-slate-400">Postage & Pack ({deepStats.waterfall.postagePackPct}%)</span>
+                      <p className="font-bold text-orange-300 mt-0.5">
+                        {fmtGBP(deepStats.totalActualPostage + deepStats.totalPackaging)}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 6 Deep-Dive Operational Metrics */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                    <span className="text-xs text-slate-400">Sell-Through & Stock Velocity</span>
+                    <div className="flex items-baseline justify-between mt-1">
+                      <span className="text-2xl font-bold text-white">{deepStats.sellThroughRate}%</span>
+                      <span className="text-xs text-emerald-400 font-semibold">
+                        Avg {deepStats.avgDaysToSell} days to sell
+                      </span>
+                    </div>
+                    <div className="w-full bg-slate-800 h-2 rounded-full mt-2 overflow-hidden">
+                      <div
+                        className="bg-indigo-500 h-full"
+                        style={{ width: `${Math.min(100, deepStats.sellThroughRate)}%` }}
+                      />
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-1.5">
+                      {deepStats.soldCount} sold items vs {deepStats.activeCount} active items in stock
+                    </p>
+                  </div>
+
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                    <span className="text-xs text-slate-400">Platform Fee Bleed Rate</span>
+                    <div className="flex items-baseline justify-between mt-1">
+                      <span className="text-2xl font-bold text-rose-400">
+                        {deepStats.feeBleedRatePercent}%
+                      </span>
+                      <span className="text-xs text-slate-300">
+                        Total Fees: {fmtGBP(deepStats.totalPlatformFees)}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-2">
+                      Percentage of gross buyer payments ({fmtGBP(deepStats.totalTopLineIngoing)}) lost to platform fees
+                    </p>
+                  </div>
+
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                    <span className="text-xs text-slate-400">Postage & Packaging Recovery Balance</span>
+                    <div className="flex items-baseline justify-between mt-1">
+                      <span
+                        className={`text-2xl font-bold ${
+                          deepStats.shippingRecoveryBalance >= 0 ? "text-emerald-400" : "text-rose-400"
+                        }`}
+                      >
+                        {deepStats.shippingRecoveryBalance >= 0 ? "+" : ""}
+                        {fmtGBP(deepStats.shippingRecoveryBalance)}
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        Charged: {fmtGBP(deepStats.totalShippingCharged)}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-2">
+                      Actual Postage ({fmtGBP(deepStats.totalActualPostage)}) + Packaging ({fmtGBP(deepStats.totalPackaging)}) vs Shipping Charged
+                    </p>
+                  </div>
+
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                    <span className="text-xs text-slate-400">Owned Stock Return on Capital (ROI)</span>
+                    <div className="flex items-baseline justify-between mt-1">
+                      <span className="text-2xl font-bold text-emerald-400">
+                        +{deepStats.ownedStockRoiPercent}%
+                      </span>
+                      <span className="text-xs text-amber-300">
+                        Active COGS Tied Up: {fmtGBP(deepStats.tiedUpOwnedCogs)}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-2">
+                      Net profit multiple generated on Owned Stock acquisitions
+                    </p>
+                  </div>
+
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                    <span className="text-xs text-slate-400">Projected Profit in Active Stock</span>
+                    <div className="flex items-baseline justify-between mt-1">
+                      <span className="text-2xl font-bold text-indigo-300">
+                        {fmtGBP(deepStats.projectedActiveBusinessProfit)}
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        Retail: {fmtGBP(deepStats.activePortfolioValue)}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-2">
+                      Your estimated 40% Consignment + 100% Owned share if all current stock sells at listed price
+                    </p>
+                  </div>
+
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                    <span className="text-xs text-slate-400">Business Net Keep Ratio</span>
+                    <div className="flex items-baseline justify-between mt-1">
+                      <span className="text-2xl font-bold text-sky-300">
+                        {deepStats.businessKeepRatePercent}%
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        Paid to Consignees: {fmtGBP(deepStats.totalConsigneeShare)}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-2">
+                      Share of every £1 in gross turnover retained by That Pop Culture Guy after fees, P&P & 60% payouts
+                    </p>
+                  </div>
+                </div>
+
+                {/* Category Profitability Matrix & Channel Efficiency */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                  <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <h3 className="text-base font-bold text-white mb-1">
+                      Category Profitability & Stock Matrix
+                    </h3>
+                    <p className="text-xs text-slate-400 mb-4">
+                      Which pop culture verticals generate the highest net business profit share
+                    </p>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="border-b border-slate-800 text-slate-400 uppercase">
+                            <th className="py-2.5 px-2">Category</th>
+                            <th className="py-2.5 px-2">Active</th>
+                            <th className="py-2.5 px-2">Sold</th>
+                            <th className="py-2.5 px-2">Gross Sales</th>
+                            <th className="py-2.5 px-2">Total Net Profit</th>
+                            <th className="py-2.5 px-2 text-right">Your Business Keep</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/60">
+                          {deepStats.categoryBreakdown.map((cat) => (
+                            <tr key={cat.category} className="hover:bg-slate-800/30">
+                              <td className="py-3 px-2 font-semibold text-white">{cat.category}</td>
+                              <td className="py-3 px-2 text-sky-300">{cat.activeCount}</td>
+                              <td className="py-3 px-2 text-emerald-300">{cat.soldCount}</td>
+                              <td className="py-3 px-2 text-slate-300">{fmtGBP(cat.gross)}</td>
+                              <td className="py-3 px-2 text-slate-200">{fmtGBP(cat.netProfit)}</td>
+                              <td className="py-3 px-2 text-right font-bold text-emerald-400">
+                                {fmtGBP(cat.businessKeep)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <h3 className="text-base font-bold text-white mb-1">
+                      Sales Channel Fee Drag vs Net Keep
+                    </h3>
+                    <p className="text-xs text-slate-400 mb-4">
+                      Compare eBay UK, Whatnot, and Cardmarket fee impact
+                    </p>
+                    <div className="space-y-3">
+                      {deepStats.channelBreakdown.map((ch) => {
+                        const feePct = ch.gross > 0 ? ((ch.fees / ch.gross) * 100).toFixed(1) : 0;
+                        return (
+                          <div
+                            key={ch.platform}
+                            className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 text-xs"
+                          >
+                            <div className="flex items-center justify-between font-bold text-white">
+                              <span>{ch.platform} ({ch.count} sales)</span>
+                              <span className="text-emerald-400">Keep: {fmtGBP(ch.businessKeep)}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-slate-400 mt-1">
+                              <span>Gross Ingoing: {fmtGBP(ch.gross)}</span>
+                              <span className="text-rose-400">
+                                Fees: -{fmtGBP(ch.fees)} ({feePct}%)
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Consignee Partner Leaderboard & Aging Stock Radar */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                  <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <h3 className="text-base font-bold text-white mb-1">
+                      Consignee Partner Leaderboard
+                    </h3>
+                    <p className="text-xs text-slate-400 mb-4">
+                      Ranked by 40% net profit contributed to That Pop Culture Guy
+                    </p>
+                    <div className="space-y-2.5">
+                      {deepStats.consigneeLeaderboard.map((c, idx) => (
+                        <div
+                          key={c.id}
+                          className="bg-slate-950 border border-slate-800 rounded-xl p-3 flex items-center justify-between text-xs"
+                        >
+                          <div>
+                            <span className="text-indigo-400 font-bold mr-2">#{idx + 1}</span>
+                            <span className="text-white font-semibold text-sm">{c.name}</span>
+                            <span className="block text-slate-400 mt-0.5">
+                              {c.soldCount} sold / {c.totalItems} total items • Gross: {fmtGBP(c.grossGenerated)}
+                            </span>
+                          </div>
+                          <div className="text-right">
+                            <span className="text-emerald-400 font-bold text-sm block">
+                              Your 40%: {fmtGBP(c.business40Earned)}
+                            </span>
+                            <span className="text-indigo-300 text-[11px]">
+                              Client 60%: {fmtGBP(c.consignee60Earned)}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <h3 className="text-base font-bold text-white mb-1">
+                      Stock Aging & Repricing Radar
+                    </h3>
+                    <p className="text-xs text-slate-400 mb-4">
+                      Active items sorted by days sitting in inventory
+                    </p>
+                    <div className="space-y-2.5">
+                      {deepStats.agingInventory.map((item) => (
+                        <div
+                          key={item.id}
+                          className="bg-slate-950 border border-slate-800 rounded-xl p-3 flex items-center justify-between text-xs"
+                        >
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-indigo-400">{item.sku}</span>
+                              <span className="text-amber-300 font-semibold">
+                                {item.daysListed} days listed
+                              </span>
+                            </div>
+                            <p className="text-white font-medium mt-0.5">{item.title}</p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-white">{fmtGBP(item.listedPrice)}</span>
+                            <button
+                              onClick={() => setEditingItem(item)}
+                              className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-2 py-1 rounded border border-slate-700"
+                            >
+                              Reprice
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            {/* ==========================================
+                TAB 3: INVENTORY & STOCK
+               ========================================== */}
+            {activeTab === "INVENTORY" && (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-5">
+                  <div>
+                    <h2 className="text-lg font-bold text-white">Inventory, Storage Bins & eBay Sync</h2>
+                    <p className="text-xs text-slate-400">
+                      Upload eBay Active Stock CSVs, filter Consigned vs Owned items, edit bins/prices, and print barcode labels
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      placeholder="Search SKU, bin, or title..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white"
+                    />
+                    <select
+                      value={stockFilterType}
+                      onChange={(e) => setStockFilterType(e.target.value)}
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white"
+                    >
+                      <option value="ALL">All Ownership</option>
+                      <option value="CONSIGNMENT">Consigned Only</option>
+                      <option value="OWNED_STOCK">Owned Only</option>
+                    </select>
+                    <select
+                      value={stockFilterStatus}
+                      onChange={(e) => setStockFilterStatus(e.target.value)}
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white"
+                    >
+                      <option value="ALL">All Statuses</option>
+                      <option value="ACTIVE">ACTIVE</option>
+                      <option value="PAYOUT_PENDING">PAYOUT_PENDING</option>
+                      <option value="COMPLETED">COMPLETED</option>
+                    </select>
+                    <button
+                      onClick={() => setShowEbayImportModal(true)}
+                      className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold px-3 py-2 rounded-lg transition"
+                    >
+                      📥 Upload eBay CSV
+                    </button>
+                    <button
+                      onClick={() => setLabelModalItems(filteredInventory)}
+                      className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium px-3 py-2 rounded-lg border border-slate-700"
+                    >
+                      🏷️ Print Labels ({filteredInventory.length})
+                    </button>
+                    <button
+                      onClick={() => setShowAddStockModal(true)}
+                      className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3.5 py-2 rounded-lg"
+                    >
+                      + Add Item
+                    </button>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-sm">
+                    <thead>
+                      <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase">
+                        <th className="py-3 px-2">SKU & Storage Bin</th>
+                        <th className="py-3 px-2">Item Title & Condition</th>
+                        <th className="py-3 px-2">Ownership</th>
+                        <th className="py-3 px-2">Listed Price</th>
+                        <th className="py-3 px-2">Status</th>
+                        <th className="py-3 px-2 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60">
+                      {filteredInventory.map((item) => {
+                        const consignee = db.consignees.find((c) => c.id === item.consigneeId);
+                        return (
+                          <tr key={item.id} className="hover:bg-slate-800/30">
+                            <td className="py-3.5 px-2">
+                              <span className="font-mono text-xs font-semibold text-indigo-400 block">
+                                {item.sku}
+                              </span>
+                              <span className="text-[11px] text-amber-300 font-mono block">
+                                📍 {item.storageLocation || "Vault A-01"}
+                              </span>
+                              <span className="text-[10px] text-slate-500">
+                                {item.platform} ({item.platformItemId})
+                              </span>
+                            </td>
+                            <td className="py-3.5 px-2">
+                              <span className="font-medium text-white block">{item.title}</span>
+                              <span className="text-xs text-slate-400">
+                                {item.category} • {item.condition}
+                              </span>
+                            </td>
+                            <td className="py-3.5 px-2">
+                              {item.acquisitionType === "CONSIGNMENT" ? (
+                                <span className="text-xs text-indigo-300 font-medium">
+                                  Consigned ({consignee?.name})
+                                </span>
+                              ) : (
+                                <span className="text-xs text-emerald-300 font-medium">
+                                  Owned (COGS: {fmtGBP(item.acquisitionCost)})
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3.5 px-2 font-semibold text-white">
+                              {fmtGBP(item.listedPrice)}
+                            </td>
+                            <td className="py-3.5 px-2">
+                              <span
+                                className={`px-2 py-0.5 text-[11px] rounded font-medium ${
+                                  item.status === "ACTIVE"
+                                    ? "bg-sky-500/20 text-sky-300"
+                                    : item.status === "PAYOUT_PENDING"
+                                    ? "bg-amber-500/20 text-amber-300"
+                                    : "bg-emerald-500/20 text-emerald-300"
+                                }`}
+                              >
+                                {item.status}
+                              </span>
+                            </td>
+                            <td className="py-3.5 px-2 text-right">
+                              <div className="flex items-center justify-end gap-1.5">
+                                <button
+                                  onClick={() => setEditingItem(item)}
+                                  className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2.5 py-1.5 rounded-lg border border-slate-700"
+                                >
+                                  ✏️ Edit
+                                </button>
+                                <button
+                                  onClick={() => setLabelModalItems([item])}
+                                  className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-2.5 py-1.5 rounded-lg border border-slate-700"
+                                >
+                                  🏷️ Label
+                                </button>
+                                {item.status === "ACTIVE" && (
+                                  <button
+                                    onClick={() => setSaleModalItem(item)}
+                                    className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-1.5 rounded-lg"
+                                  >
+                                    Record Sale
+                                  </button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ==========================================
+                TAB 4: 60/40 SALES LEDGER
+               ========================================== */}
+            {activeTab === "SALES" && (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
+                  <div>
+                    <h2 className="text-lg font-bold text-white">Sales Records & 60/40 Profit-Split Ledger</h2>
+                    <p className="text-xs text-slate-400">
+                      Import eBay Orders CSVs, void/refund cancelled orders, or export HMRC spreadsheets
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setShowEbayImportModal(true)}
+                      className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold px-3.5 py-2 rounded-lg"
+                    >
+                      📥 Import eBay Orders CSV
+                    </button>
+                    <button
+                      onClick={downloadUkAccountantCsv}
+                      className="bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium px-3.5 py-2 rounded-lg border border-slate-700"
+                    >
+                      Download Accountant CSV
+                    </button>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-800 text-slate-400 uppercase">
+                        <th className="py-3 px-2">Date / SKU</th>
+                        <th className="py-3 px-2">Item & Buyer</th>
+                        <th className="py-3 px-2">Gross+Ship</th>
+                        <th className="py-3 px-2">Fees/P&P/COGS</th>
+                        <th className="py-3 px-2">Net Profit</th>
+                        <th className="py-3 px-2">Consignee 60%</th>
+                        <th className="py-3 px-2">Business Share</th>
+                        <th className="py-3 px-2 text-right">Status / Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60">
+                      {db.sales.map((s) => {
+                        const item = db.inventory.find((i) => i.id === s.inventoryItemId);
+                        const grossPlusShip = Number(s.grossSalePrice) + Number(s.shippingChargedToBuyer);
+                        const deductions =
+                          Number(s.platformFeeAmount) +
+                          Number(s.actualPostageCost) +
+                          Number(s.packagingCost) +
+                          Number(s.ownedStockCogs);
+
+                        return (
+                          <tr key={s.id} className="hover:bg-slate-800/30">
+                            <td className="py-3 px-2">
+                              <span className="text-white block">{s.saleDate}</span>
+                              <span className="font-mono text-indigo-400">{item?.sku}</span>
+                            </td>
+                            <td className="py-3 px-2">
+                              <span className="text-white font-medium block">{item?.title}</span>
+                              <span className="text-slate-400">Buyer: {s.buyerUsername || "N/A"}</span>
+                            </td>
+                            <td className="py-3 px-2 text-slate-200">{fmtGBP(grossPlusShip)}</td>
+                            <td className="py-3 px-2 text-rose-400">-{fmtGBP(deductions)}</td>
+                            <td className="py-3 px-2 font-bold text-white">{fmtGBP(s.netProfit)}</td>
+                            <td className="py-3 px-2 font-bold text-indigo-300">
+                              {fmtGBP(s.consigneePayoutAmount)}
+                            </td>
+                            <td className="py-3 px-2 font-bold text-emerald-300">
+                              {fmtGBP(s.businessProfitShare)}
+                            </td>
+                            <td className="py-3 px-2 text-right">
+                              <div className="flex items-center justify-end gap-2">
+                                <span
+                                  className={`px-2 py-0.5 rounded font-semibold text-[10px] ${
+                                    s.payoutStatus === "UNPAID"
+                                      ? "bg-amber-500/20 text-amber-300"
+                                      : s.payoutStatus === "PAID"
+                                      ? "bg-emerald-500/20 text-emerald-300"
+                                      : "bg-slate-800 text-slate-300"
+                                  }`}
+                                >
+                                  {s.payoutStatus}
+                                </span>
+                                {s.payoutStatus !== "PAID" && (
+                                  <button
+                                    onClick={() => handleVoidSale(s.id)}
+                                    className="text-[11px] text-rose-400 hover:text-rose-300 bg-rose-950/40 border border-rose-500/30 px-2 py-1 rounded"
+                                    title="Void sale and return item to ACTIVE stock"
+                                  >
+                                    ↩️ Void
+                                  </button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ==========================================
+                TAB 5: CONSIGNEES & PAYOUTS
+               ========================================== */}
+            {activeTab === "CONSIGNEES" && (
+              <div className="space-y-6">
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                  <div className="flex items-center justify-between mb-4">
+                    <div>
+                      <h2 className="text-lg font-bold text-white">Consignee Accounts & 60% Settlements</h2>
+                      <p className="text-xs text-slate-400">
+                        Manage consignee bank details, active stock, and generate printable settlement statements
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setShowAddConsigneeModal(true)}
+                      className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3.5 py-2 rounded-lg"
+                    >
+                      + New Consignee
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    {db.consignees.map((c) => {
+                      const items = db.inventory.filter((i) => i.consigneeId === c.id);
+                      const unpaidSales = db.sales.filter((s) => {
+                        const item = db.inventory.find((i) => i.id === s.inventoryItemId);
+                        return s.payoutStatus === "UNPAID" && item?.consigneeId === c.id;
+                      });
+                      const unpaidTotal = unpaidSales.reduce(
+                        (acc, s) => acc + Number(s.consigneePayoutAmount),
+                        0
+                      );
+
+                      return (
+                        <div
+                          key={c.id}
+                          className="bg-slate-950 border border-slate-800 rounded-xl p-4 flex flex-col justify-between"
+                        >
+                          <div>
+                            <div className="flex items-center justify-between">
+                              <h3 className="font-bold text-white text-base">{c.name}</h3>
+                              <span className="text-[11px] px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-semibold">
+                                {c.defaultSplit}/{100 - c.defaultSplit} Split
+                              </span>
+                            </div>
+                            <p className="text-xs text-slate-400 mt-1">{c.email} • {c.phone}</p>
+                            {c.address && <p className="text-xs text-slate-500 mt-0.5">{c.address}</p>}
+                            <div className="mt-2.5 p-2 rounded bg-slate-900 border border-slate-800 text-xs font-mono text-slate-300">
+                              {c.bankDetails}
+                            </div>
+                            {c.notes && <p className="text-xs text-slate-400 mt-2 italic">"{c.notes}"</p>}
+                          </div>
+                          <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between">
+                            <div>
+                              <span className="text-[11px] text-slate-400 block">
+                                Total Stock: {items.length} items
+                              </span>
+                              <span className="text-sm font-bold text-indigo-300">
+                                Owing: {fmtGBP(unpaidTotal)}
+                              </span>
+                            </div>
+                            <button
+                              disabled={unpaidSales.length === 0}
+                              onClick={() => handleSettleConsigneePayout(c.id)}
+                              className={`px-3 py-1.5 rounded-lg text-xs font-medium ${
+                                unpaidSales.length > 0
+                                  ? "bg-indigo-600 hover:bg-indigo-500 text-white"
+                                  : "bg-slate-800 text-slate-500 cursor-not-allowed"
+                              }`}
+                            >
+                              {unpaidSales.length > 0 ? "Settle & Statement" : "Settled"}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                  <h3 className="text-base font-bold text-white mb-3">
+                    Completed Payouts & Printable Settlement Statements
+                  </h3>
+                  {db.payouts.length === 0 ? (
+                    <p className="text-xs text-slate-400">
+                      No payouts settled yet. Tap "Settle & Statement" on any consignee above to generate a batch payout and printable PDF statement.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {db.payouts.map((po) => (
+                        <div
+                          key={po.id}
+                          className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm"
+                        >
+                          <div>
+                            <span className="font-mono text-indigo-400 font-semibold">{po.payoutNumber}</span>
+                            <span className="text-white font-medium ml-2">{po.consigneeName}</span>
+                            <span className="text-xs text-slate-400 block sm:inline sm:ml-3">
+                              Paid {po.paidAt} • Ref: {po.paymentReference}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="font-bold text-emerald-400">
+                              {fmtGBP(po.totalPayoutAmount)}
+                            </span>
+                            <button
+                              onClick={() => setStatementModalPayout(po)}
+                              className="bg-slate-800 hover:bg-slate-700 text-xs text-white px-3 py-1.5 rounded-lg border border-slate-700"
+                            >
+                              View / Print Statement PDF
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ==========================================
+                TAB 6: EXPENSES & CASH-FLOW LEDGER
+               ========================================== */}
+            {activeTab === "EXPENSES" && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
+                  <div className="flex items-center justify-between mb-4">
+                    <div>
+                      <h2 className="text-base font-bold text-white">Business Expenses & Receipts</h2>
+                      <p className="text-xs text-slate-400">
+                        Deductible overheads reduce UK taxable net profit
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setShowAddExpenseModal(true)}
+                      className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg"
+                    >
+                      + Log Expense & Receipt
+                    </button>
+                  </div>
+                  <div className="space-y-2.5">
+                    {db.expenses.map((exp) => (
+                      <div
+                        key={exp.id}
+                        className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-sm"
+                      >
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium text-white">{exp.merchant}</span>
+                            <span className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                              {exp.category}
+                            </span>
+                          </div>
+                          <span className="text-xs text-slate-400 block mt-0.5">{exp.description}</span>
+                          <span className="text-[11px] text-indigo-400 block mt-0.5">
+                            {exp.expenseDate} • Receipt: {exp.receiptName}
+                          </span>
+                        </div>
+                        <div className="text-right">
+                          <span className="font-bold text-rose-400 block">-{fmtGBP(exp.amount)}</span>
+                          <span className="text-[10px] text-emerald-400">
+                            {exp.allocatedToItemSale ? "Item-Allocated" : "HMRC Deductible"}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
+                  <h2 className="text-base font-bold text-white mb-1">Cash-Flow Ledger (Ingoings/Outgoings)</h2>
+                  <p className="text-xs text-slate-400 mb-4">
+                    Live audit trail of gross receipts, fee deductions, COGS, expenses & 60% payouts
+                  </p>
+                  <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
+                    {db.cashFlow.map((cf) => (
+                      <div
+                        key={cf.id}
+                        className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-xs"
+                      >
+                        <div>
+                          <span
+                            className={`px-1.5 py-0.5 rounded font-bold text-[10px] mr-2 ${
+                              cf.type === "INGOING"
+                                ? "bg-emerald-500/20 text-emerald-300"
+                                : "bg-rose-500/20 text-rose-300"
+                            }`}
+                          >
+                            {cf.type}
+                          </span>
+                          <span className="text-slate-400">{cf.entryDate} • {cf.source}</span>
+                          <p className="text-slate-200 font-medium mt-1">{cf.description}</p>
+                        </div>
+                        <span
+                          className={`font-bold whitespace-nowrap ml-2 ${
+                            cf.type === "INGOING" ? "text-emerald-400" : "text-rose-400"
+                          }`}
+                        >
+                          {cf.type === "INGOING" ? "+" : "-"}
+                          {fmtGBP(cf.amount)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ==========================================
+                TAB 7: UK TAX ENGINE & DOCUMENT VAULT
+               ========================================== */}
+            {activeTab === "TAX_DOCS" && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
+                  <div className="flex items-center justify-between mb-3">
+                    <h2 className="text-base font-bold text-white">
+                      UK HMRC Tax Liability Engine (2026/27)
+                    </h2>
+                    <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs">
+                      <button
+                        onClick={() => setTaxEntityMode("SOLE_TRADER")}
+                        className={`px-2.5 py-1 rounded ${
+                          taxEntityMode === "SOLE_TRADER" ? "bg-indigo-600 text-white" : "text-slate-400"
+                        }`}
+                      >
+                        Sole Trader
+                      </button>
+                      <button
+                        onClick={() => setTaxEntityMode("LIMITED_COMPANY")}
+                        className={`px-2.5 py-1 rounded ${
+                          taxEntityMode === "LIMITED_COMPANY" ? "bg-indigo-600 text-white" : "text-slate-400"
+                        }`}
+                      >
+                        Ltd Company
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-2.5 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">40% Consignment Business Share</span>
+                      <span className="text-white">{fmtGBP(metrics.consignment40Profit)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">100% Owned Stock Profit (After COGS)</span>
+                      <span className="text-white">{fmtGBP(metrics.owned100Profit)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Less: Deductible Overheads</span>
+                      <span className="text-rose-400">-{fmtGBP(metrics.deductibleOverheads)}</span>
+                    </div>
+                    <div className="border-t border-slate-800 pt-2 flex justify-between font-bold">
+                      <span>HMRC Taxable Net Profit</span>
+                      <span className="text-emerald-400">
+                        {fmtGBP(metrics.taxBreakdown.taxableNetProfit)}
+                      </span>
+                    </div>
+                    <div className="border-t border-slate-800 pt-2 space-y-1 text-xs">
+                      <div className="flex justify-between text-slate-300">
+                        <span>
+                          {taxEntityMode === "SOLE_TRADER" ? "Income Tax:" : "Corporation Tax:"}
+                        </span>
+                        <span>{fmtGBP(metrics.taxBreakdown.incomeOrCorpTax)}</span>
+                      </div>
+                      {taxEntityMode === "SOLE_TRADER" && (
+                        <div className="flex justify-between text-slate-300">
+                          <span>Class 4 National Insurance:</span>
+                          <span>{fmtGBP(metrics.taxBreakdown.class4NationalInsurance)}</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex justify-between font-bold text-amber-400 pt-1">
+                      <span>Total Estimated UK Tax Reserve</span>
+                      <span>{fmtGBP(metrics.taxBreakdown.totalEstimatedTaxLiability)}</span>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <button
+                      onClick={downloadUkAccountantCsv}
+                      className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3.5 py-2 rounded-lg"
+                    >
+                      Download UK Tax CSV
+                    </button>
+                    <button
+                      onClick={exportDatabaseBackupJson}
+                      className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium px-3.5 py-2 rounded-lg"
+                    >
+                      Export Backup (.json)
+                    </button>
+                    <label className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium px-3.5 py-2 rounded-lg cursor-pointer">
+                      Import Backup
+                      <input type="file" accept=".json" onChange={importDatabaseBackupJson} className="hidden" />
+                    </label>
+                    <button
+                      onClick={resetDemoData}
+                      className="bg-slate-900 hover:bg-slate-800 text-slate-400 text-xs px-3 py-2 rounded-lg border border-slate-800"
+                    >
+                      Reset Demo
+                    </button>
+                  </div>
+                </div>
+
+                <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
+                  <h2 className="text-base font-bold text-white mb-3">Document Management Vault</h2>
+                  <div className="space-y-2 max-h-[380px] overflow-y-auto">
+                    {db.documents.map((doc) => (
+                      <div
+                        key={doc.id}
+                        className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-xs"
+                      >
+                        <div>
+                          <span className="font-medium text-white block">{doc.fileName}</span>
+                          <span className="text-slate-400">{doc.linkedTo} • {doc.uploadedAt}</span>
+                        </div>
+                        <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px]">
+                          {doc.documentType}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </main>
+
+          {/* ==========================================
+              MODALS
+             ========================================== */}
+          {showEbayImportModal && (
+            <EbayCsvImportModal
+              consignees={db.consignees}
+              onClose={() => setShowEbayImportModal(false)}
+              onImportRows={handleBulkEbayImport}
+            />
+          )}
+
+          {saleModalItem && (
+            <RecordSaleModal
+              item={saleModalItem}
+              consignee={db.consignees.find((c) => c.id === saleModalItem.consigneeId)}
+              onClose={() => setSaleModalItem(null)}
+              onConfirm={handleConfirmRecordSale}
+            />
+          )}
+
+          {editingItem && (
+            <div className="fixed inset-0 bg-black/75 z-50 flex items-center justify-center p-4 no-print">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6">
+                <h3 className="text-lg font-bold text-white mb-1">Edit Stock Item / Reprice</h3>
+                <p className="text-xs text-indigo-300 mb-4 font-mono">{editingItem.sku}</p>
+                <form onSubmit={handleEditStockSave} className="space-y-3 text-sm">
+                  <div>
+                    <label className="text-xs text-slate-400">Item Title</label>
+                    <input
+                      name="title"
+                      required
+                      defaultValue={editingItem.title}
+                      className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs text-slate-400">Listed Price (£)</label>
+                      <input
+                        name="listedPrice"
+                        type="number"
+                        step="0.01"
+                        required
+                        defaultValue={editingItem.listedPrice}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-400">Storage Bin</label>
+                      <input
+                        name="storageLocation"
+                        required
+                        defaultValue={editingItem.storageLocation || "Vault A-01"}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-amber-300"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs text-slate-400">Condition</label>
+                      <input
+                        name="condition"
+                        required
+                        defaultValue={editingItem.condition}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-400">Sales Channel</label>
+                      <select
+                        name="platform"
+                        defaultValue={editingItem.platform || "EBAY"}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                      >
+                        <option value="EBAY">eBay UK (Biz)</option>
+                        <option value="EBAY_PRIVATE">eBay UK (Private)</option>
+                        <option value="WHATNOT">Whatnot UK</option>
+                        <option value="CARDMARKET">Cardmarket</option>
+                        <option value="VINTED">Vinted UK</option>
+                        <option value="SHOPIFY">Shopify UK</option>
+                        <option value="IN_PERSON_EVENT">In-Person Show</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2 pt-3">
+                    <button
+                      type="button"
+                      onClick={() => setEditingItem(null)}
+                      className="px-4 py-2 text-xs text-slate-400"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-4 py-2 rounded-lg"
+                    >
+                      Save Changes
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {showAddStockModal && (
+            <div className="fixed inset-0 bg-black/75 z-50 flex items-center justify-center p-4 no-print">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 max-h-[92vh] overflow-y-auto">
+                <h3 className="text-lg font-bold text-white mb-3">Add Inventory Stock Item</h3>
+                <form onSubmit={handleAddStock} className="space-y-3 text-sm">
+                  <div className="grid grid-cols-3 gap-2">
+                    <input name="sku" required placeholder="SKU (e.g. TCG-01)" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                    <input name="storageLocation" required defaultValue="Vault A-01" placeholder="Storage Bin" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-amber-300" />
+                    <select name="category" className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-2 text-white">
+                      <option value="TRADING_CARDS">Trading Cards</option>
+                      <option value="LEGO">LEGO</option>
+                      <option value="ACTION_FIGURES">Figures</option>
+                      <option value="FUNKO_POP">Funko Pop</option>
+                      <option value="COMICS">Comics</option>
+                      <option value="VIDEO_GAMES">Video Games</option>
+                    </select>
+                  </div>
+                  <input name="title" required placeholder="Item Title" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  <div className="grid grid-cols-2 gap-2">
+                    <select name="acquisitionType" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white">
+                      <option value="CONSIGNMENT">CONSIGNMENT (60/40)</option>
+                      <option value="OWNED_STOCK">OWNED_STOCK (100%)</option>
+                    </select>
+                    <select name="consigneeId" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white">
+                      {db.consignees.map((c) => (
+                        <option key={c.id} value={c.id}>{c.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <input name="listedPrice" type="number" step="0.01" required placeholder="Price £" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                    <input name="acquisitionCost" type="number" step="0.01" placeholder="Owned COGS £" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                    <select name="platform" className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-2 text-white">
+                      <option value="EBAY">eBay UK (Biz)</option>
+                      <option value="EBAY_PRIVATE">eBay UK (Private)</option>
+                      <option value="WHATNOT">Whatnot UK</option>
+                      <option value="CARDMARKET">Cardmarket</option>
+                      <option value="VINTED">Vinted UK</option>
+                      <option value="SHOPIFY">Shopify UK</option>
+                      <option value="IN_PERSON_EVENT">In-Person Show</option>
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <input name="condition" required placeholder="Condition (e.g. PSA 10 / MISB)" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                    <input name="platformItemId" placeholder="eBay Item ID (Optional)" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  </div>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <button type="button" onClick={() => setShowAddStockModal(false)} className="px-4 py-2 text-xs text-slate-400">Cancel</button>
+                    <button type="submit" className="bg-indigo-600 text-white text-xs font-medium px-4 py-2 rounded-lg">Save Item</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {showAddConsigneeModal && (
+            <div className="fixed inset-0 bg-black/75 z-50 flex items-center justify-center p-4 no-print">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 max-h-[92vh] overflow-y-auto">
+                <h3 className="text-lg font-bold text-white mb-3">New Consignee Account</h3>
+                <form onSubmit={handleAddConsignee} className="space-y-3 text-sm">
+                  <input name="name" required placeholder="Full Name *" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  <div className="grid grid-cols-2 gap-2">
+                    <input name="email" type="email" required placeholder="Email *" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                    <input name="phone" placeholder="Phone" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <input name="bankDetails" required placeholder="Sort Code & Account No *" className="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                    <input name="defaultSplit" type="number" defaultValue="60" placeholder="Split %" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  </div>
+                  <input name="address" placeholder="UK Postal Address" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  <input name="notes" placeholder="Notes (e.g. Pokemon & LEGO specialist)" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  <div>
+                    <label className="text-xs text-slate-400">Attach Signed Consignment Contract (PDF)</label>
+                    <input name="agreementFile" type="file" className="w-full mt-1 text-xs text-slate-400 file:mr-2 file:py-1 file:px-2.5 file:rounded file:border-0 file:bg-slate-800 file:text-slate-200" />
+                  </div>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <button type="button" onClick={() => setShowAddConsigneeModal(false)} className="px-4 py-2 text-xs text-slate-400">Cancel</button>
+                    <button type="submit" className="bg-indigo-600 text-white text-xs font-medium px-4 py-2 rounded-lg">Save Consignee</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {showAddExpenseModal && (
+            <div className="fixed inset-0 bg-black/75 z-50 flex items-center justify-center p-4 no-print">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 max-h-[92vh] overflow-y-auto">
+                <h3 className="text-lg font-bold text-white mb-3">Log Business Expense & Receipt</h3>
+                <form onSubmit={handleAddExpense} className="space-y-3 text-sm">
+                  <div className="grid grid-cols-2 gap-2">
+                    <input name="merchant" required placeholder="Merchant (e.g. SafeStore) *" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                    <input name="amount" type="number" step="0.01" required placeholder="Amount (£) *" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <select name="category" className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-2 text-white">
+                      <option value="STORAGE_AND_RENT">Storage & Rent</option>
+                      <option value="PACKAGING_SUPPLIES">Packaging Supplies</option>
+                      <option value="PLATFORM_SUBSCRIPTIONS">Platform Subscriptions</option>
+                      <option value="EVENT_TABLES_AND_TRAVEL">Event Tables & Travel</option>
+                      <option value="EQUIPMENT_AND_HARDWARE">Equipment & Hardware</option>
+                      <option value="ACCOUNTING_AND_LEGAL">Accounting & Legal</option>
+                    </select>
+                    <input name="expenseDate" type="date" defaultValue={new Date().toISOString().split("T")[0]} className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  </div>
+                  <input name="description" required placeholder="Description *" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  <label className="flex items-center gap-2 text-xs text-slate-300">
+                    <input name="allocatedToItemSale" type="checkbox" className="rounded" />
+                    Already deducted inside an individual SaleRecord (prevent double tax deduction)
+                  </label>
+                  <div>
+                    <label className="text-xs text-slate-400">Attach Receipt Image / PDF</label>
+                    <input name="receiptFile" type="file" className="w-full mt-1 text-xs text-slate-400 file:mr-2 file:py-1 file:px-2.5 file:rounded file:border-0 file:bg-slate-800 file:text-slate-200" />
+                  </div>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <button type="button" onClick={() => setShowAddExpenseModal(false)} className="px-4 py-2 text-xs text-slate-400">Cancel</button>
+                    <button type="submit" className="bg-indigo-600 text-white text-xs font-medium px-4 py-2 rounded-lg">Save Expense</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {statementModalPayout && (
+            <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
+              <div className="bg-white text-slate-900 rounded-2xl max-w-2xl w-full p-6 shadow-2xl max-h-[90vh] overflow-y-auto">
+                <div className="printable-area">
+                  <div className="flex justify-between items-start border-b border-slate-200 pb-3">
+                    <div>
+                      <h2 className="text-xl font-black">THAT POP CULTURE GUY</h2>
+                      <p className="text-xs font-bold text-indigo-700">60/40 CONSIGNMENT SETTLEMENT STATEMENT</p>
+                    </div>
+                    <div className="text-right text-xs text-slate-600">
+                      <p className="font-bold text-slate-900">{statementModalPayout.payoutNumber}</p>
+                      <p>Date: {statementModalPayout.paidAt}</p>
+                      <p>Ref: {statementModalPayout.paymentReference}</p>
+                    </div>
+                  </div>
+                  <div className="my-3 text-xs bg-slate-50 p-2.5 rounded border border-slate-200">
+                    <p className="font-bold">{statementModalPayout.consigneeName} ({statementModalPayout.consigneeEmail})</p>
+                    <p>{statementModalPayout.consigneeBank}</p>
+                  </div>
+                  <table className="w-full text-left text-xs border-collapse my-3">
+                    <thead>
+                      <tr className="border-b-2 border-slate-300">
+                        <th className="py-1">SKU</th>
+                        <th className="py-1">Title</th>
+                        <th className="py-1">Gross+Ship</th>
+                        <th className="py-1">Fees/P&P</th>
+                        <th className="py-1">Net Profit</th>
+                        <th className="py-1 text-right">Your 60%</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {statementModalPayout.items.map((it, idx) => (
+                        <tr key={idx} className="border-b border-slate-200">
+                          <td className="py-1.5 font-mono">{it.sku}</td>
+                          <td className="py-1.5">{it.title}</td>
+                          <td className="py-1.5">{fmtGBP(it.grossPlusShipping)}</td>
+                          <td className="py-1.5 text-rose-600">-{fmtGBP(it.deductions)}</td>
+                          <td className="py-1.5">{fmtGBP(it.netProfit)}</td>
+                          <td className="py-1.5 text-right font-bold text-indigo-700">{fmtGBP(it.consigneeShare60)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <p className="text-right font-black text-base mt-3 border-t-2 border-slate-900 pt-2">
+                    TOTAL PAYOUT PAID: {fmtGBP(statementModalPayout.totalPayoutAmount)}
+                  </p>
+                </div>
+                <div className="flex justify-end gap-2 mt-4 no-print">
+                  <button onClick={() => setStatementModalPayout(null)} className="px-4 py-2 text-xs text-slate-600">Close</button>
+                  <button onClick={() => window.print()} className="bg-indigo-600 text-white text-xs font-semibold px-4 py-2 rounded-lg">Print / Save PDF</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {labelModalItems && (
+            <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
+              <div className="bg-white text-slate-900 rounded-2xl max-w-3xl w-full p-6 max-h-[90vh] overflow-y-auto">
+                <div className="flex justify-between items-center mb-4 no-print">
+                  <h3 className="font-bold">Printable SKU Barcode Labels ({labelModalItems.length})</h3>
+                  <div className="flex gap-2">
+                    <button onClick={() => setLabelModalItems(null)} className="px-3 py-1.5 text-xs">Close</button>
+                    <button onClick={() => window.print()} className="bg-indigo-600 text-white text-xs px-4 py-1.5 rounded-lg">🖨️ Print</button>
+                  </div>
+                </div>
+                <div className="printable-area grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {labelModalItems.map((item) => (
+                    <div key={item.id} className="label-card-print border-2 border-black rounded-xl p-3">
+                      <div className="flex justify-between text-[10px] font-bold border-b border-black pb-1">
+                        <span>THAT POP CULTURE GUY</span>
+                        <span>BIN: {item.storageLocation || "VAULT-A1"}</span>
+                      </div>
+                      <p className="text-xs font-bold my-1.5">{item.title}</p>
+                      <div className="flex justify-between text-[10px] text-slate-700 mb-1">
+                        <span>COND: {item.condition}</span>
+                        <span>{item.acquisitionType}</span>
+                      </div>
+                      <div className="flex justify-between items-baseline">
+                        <span className="font-mono text-xs font-black">{item.sku}</span>
+                        <span className="text-lg font-black">{fmtGBP(item.listedPrice)}</span>
+                      </div>
+                      <SvgBarcode value={item.sku} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
