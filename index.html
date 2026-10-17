@@ -45,23 +45,39 @@
     const { useState, useEffect, useMemo } = React;
 
     // ==========================================
-    // 1. SECURITY & STORAGE CONFIGURATION
+    // 1. SECURITY & CLEAN STORAGE CONFIGURATION
     // ==========================================
     const MASTER_PIN = "2026";
     const PIN_STORAGE_KEY = "tpcg_custom_pin_v1";
     const SESSION_UNLOCK_KEY = "tpcg_session_unlocked_v1";
-    const STORAGE_KEY = "tpcg_platform_state_v4";
+    const STORAGE_KEY = "tpcg_clean_production_v1";
 
     const toPence = (gbp) => Math.round((Number(gbp) || 0) * 100);
     const toGbp = (pence) => Number((pence / 100).toFixed(2));
     const fmtGBP = (val) =>
       new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(Number(val) || 0);
 
+    const MONTHS_MAP = {
+      jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+      jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12"
+    };
+
     function normalizeUkDateToIso(rawDate) {
       if (!rawDate) return new Date().toISOString().split("T")[0];
-      const str = String(rawDate).trim();
+      const str = String(rawDate).trim().replace(/"/g, "");
       if (/^\d{4}-\d{2}-\d{2}/.test(str)) return str.slice(0, 10);
 
+      // eBay UK format: "16 Oct 2026" or "16-Oct-26" or "16-Oct-2026"
+      const textMonth = str.match(/^(\d{1,2})[\s\-]([A-Za-z]{3})[a-z]*[\s\-,]+(\d{2,4})/);
+      if (textMonth) {
+        const day = String(textMonth[1]).padStart(2, "0");
+        const mon = MONTHS_MAP[textMonth[2].toLowerCase()] || "01";
+        let yr = String(textMonth[3]);
+        if (yr.length === 2) yr = "20" + yr;
+        return `${yr}-${mon}-${day}`;
+      }
+
+      // UK numeric format: DD/MM/YYYY or DD-MM-YYYY
       const ukSlash = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
       if (ukSlash) {
         const day = String(ukSlash[1]).padStart(2, "0");
@@ -77,6 +93,17 @@
       }
       return new Date().toISOString().split("T")[0];
     }
+
+    // 1-Tap UK Royal Mail / Evri Postage Presets
+    const UK_POSTAGE_PRESETS = [
+      { label: "RM 2nd Large Letter (£1.55)", cost: 1.55 },
+      { label: "Evri Small Parcel (£2.70)", cost: 2.70 },
+      { label: "RM Tracked 48 (£3.29)", cost: 3.29 },
+      { label: "RM Tracked 24 (£3.99)", cost: 3.99 },
+      { label: "RM Special Delivery (£8.35)", cost: 8.35 },
+      { label: "RM Special Delivery £2.5k (£11.15)", cost: 11.15 },
+      { label: "Free / Local Collection (£0.00)", cost: 0.00 },
+    ];
 
     const UK_PLATFORM_PRESETS = {
       EBAY: {
@@ -144,6 +171,7 @@
       grossSalePrice,
       shippingChargedToBuyer,
       platformFeeAmount,
+      adFeeAmount = 0,
       actualPostageCost,
       packagingCost,
       acquisitionCost = 0,
@@ -152,12 +180,13 @@
       const grossP = toPence(grossSalePrice);
       const shipInP = toPence(shippingChargedToBuyer);
       const feeP = toPence(platformFeeAmount);
+      const adFeeP = toPence(adFeeAmount);
       const postOutP = toPence(actualPostageCost);
       const packP = toPence(packagingCost);
       const cogsP = acquisitionType === "OWNED_STOCK" ? toPence(acquisitionCost) : 0;
 
       const totalIngoingP = grossP + shipInP;
-      const totalDirectCostsP = feeP + postOutP + packP + cogsP;
+      const totalDirectCostsP = feeP + adFeeP + postOutP + packP + cogsP;
       const netProfitP = totalIngoingP - totalDirectCostsP;
 
       if (acquisitionType === "OWNED_STOCK") {
@@ -317,23 +346,31 @@
 
     function guessCategoryFromTitle(title) {
       const t = (title || "").toLowerCase();
-      if (t.includes("pokemon") || t.includes("pokémon") || t.includes("psa") || t.includes("charizard") || t.includes("tcg") || t.includes("magic") || t.includes("umbreon") || t.includes("rayquaza")) return "TRADING_CARDS";
-      if (t.includes("lego") || t.includes("minifig") || t.includes("ucs")) return "LEGO";
+      if (t.includes("pokemon") || t.includes("pokémon") || t.includes("psa") || t.includes("charizard") || t.includes("tcg") || t.includes("magic") || t.includes("umbreon") || t.includes("rayquaza") || t.includes("card")) return "TRADING_CARDS";
+      if (t.includes("lego") || t.includes("minifig") || t.includes("ucs") || t.includes("brick")) return "LEGO";
       if (t.includes("funko") || t.includes("pop!")) return "FUNKO_POP";
       if (t.includes("hot toys") || t.includes("hasbro") || t.includes("figure") || t.includes("sideshow") || t.includes("neca")) return "ACTION_FIGURES";
       if (t.includes("cgc") || t.includes("comic") || t.includes("marvel") || t.includes("asm")) return "COMICS";
-      if (t.includes("gameboy") || t.includes("nintendo") || t.includes("playstation") || t.includes("sega") || t.includes("zelda")) return "VIDEO_GAMES";
+      if (t.includes("gameboy") || t.includes("nintendo") || t.includes("playstation") || t.includes("sega") || t.includes("zelda") || t.includes("xbox")) return "VIDEO_GAMES";
       return "TRADING_CARDS";
     }
 
-    function parseEbayCsvReport(csvText, defaultAcquisitionType = "CONSIGNMENT", defaultConsigneeId = "con-1") {
+    function parseEbayCsvReport(
+      csvText,
+      defaultAcquisitionType = "CONSIGNMENT",
+      defaultConsigneeId = "",
+      defaultFeePreset = "EBAY",
+      defaultAdPct = 0,
+      defaultPostage = 3.29,
+      defaultPackaging = 0.85
+    ) {
       const rawLines = csvText
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter((l) => l.length > 0);
 
       let headerIdx = 0;
-      for (let i = 0; i < Math.min(rawLines.length, 15); i++) {
+      for (let i = 0; i < Math.min(rawLines.length, 20); i++) {
         const lower = rawLines[i].toLowerCase();
         if (
           lower.includes("item number") ||
@@ -357,13 +394,14 @@
       const colTitle = findCol(["item title", "title", "product"]);
       const colSku = findCol(["custom label", "sku"]);
       const colStartPrice = findCol(["start price", "buy it now price", "listed price", "price"]);
-      const colSoldFor = findCol(["sold for", "sale price", "gross"]);
+      const colSoldFor = findCol(["sold for", "sale price", "gross", "total price"]);
       const colShipping = findCol(["postage and packaging", "shipping", "delivery"]);
       const colFvfFixed = findCol(["final value fee - fixed", "fixed fee"]);
-      const colFvfVar = findCol(["final value fee - variable", "platform fee", "fee"]);
+      const colFvfVar = findCol(["final value fee - variable", "platform fee", "transaction fee"]);
+      const colAdFee = findCol(["promoted listings", "ad fee", "advertising"]);
       const colCondition = findCol(["condition"]);
       const colBuyer = findCol(["buyer username", "buyer name", "buyer"]);
-      const colSaleDate = findCol(["sale date", "order date", "date"]);
+      const colSaleDate = findCol(["sale date", "order date", "paid on date", "date"]);
       const colOrderNum = findCol(["order number"]);
 
       const isSalesReport = colOrderNum !== -1 || colSoldFor !== -1 || colSaleDate !== -1;
@@ -374,7 +412,7 @@
         if (cols.length < 2) continue;
 
         const title = (colTitle !== -1 ? cols[colTitle] : "") || "";
-        if (!title || title.toLowerCase().includes("total")) continue;
+        if (!title || title.toLowerCase().includes("total") || title.length < 2) continue;
 
         const itemId = (colItemId !== -1 ? cols[colItemId] : "") || `EB-${Date.now()}-${i}`;
         const rawSku = (colSku !== -1 ? cols[colSku] : "") || `EBAY-${String(itemId).slice(-5)}`;
@@ -388,12 +426,19 @@
         const shippingCharged = cleanCurrency(colShipping !== -1 ? cols[colShipping] : 0);
 
         let fee = 0;
-        if (colFvfFixed !== -1 || colFvfVar !== -1) {
-          fee =
-            cleanCurrency(colFvfFixed !== -1 ? cols[colFvfFixed] : 0) +
-            cleanCurrency(colFvfVar !== -1 ? cols[colFvfVar] : 0);
+        const csvFee =
+          cleanCurrency(colFvfFixed !== -1 ? cols[colFvfFixed] : 0) +
+          cleanCurrency(colFvfVar !== -1 ? cols[colFvfVar] : 0);
+
+        if (csvFee > 0) {
+          fee = csvFee;
         } else if (isSalesReport && price > 0) {
-          fee = calculatePlatformFeeByPreset("EBAY", price, shippingCharged);
+          fee = calculatePlatformFeeByPreset(defaultFeePreset, price, shippingCharged);
+        }
+
+        let adFee = cleanCurrency(colAdFee !== -1 ? cols[colAdFee] : 0);
+        if (adFee === 0 && isSalesReport && Number(defaultAdPct) > 0) {
+          adFee = Number((((price + shippingCharged) * Number(defaultAdPct)) / 100).toFixed(2));
         }
 
         const rawDateStr = colSaleDate !== -1 ? cols[colSaleDate] : "";
@@ -409,15 +454,21 @@
           acquisitionType: acqType,
           consigneeId: acqType === "CONSIGNMENT" ? defaultConsigneeId : null,
           acquisitionCost: 0,
-          listedPrice: price || 29.99,
-          grossSalePrice: price || 29.99,
+          listedPrice: price || 0,
+          grossSalePrice: price || 0,
           shippingChargedToBuyer: shippingCharged,
           platformFeeAmount: Number(fee.toFixed(2)),
-          actualPostageCost: shippingCharged > 0 ? Number(Math.max(0, shippingCharged - 0.5).toFixed(2)) : 4.45,
-          packagingCost: 1.25,
+          adFeeAmount: Number(adFee.toFixed(2)),
+          actualPostageCost: Number(Number(defaultPostage).toFixed(2)),
+          packagingCost: Number(Number(defaultPackaging).toFixed(2)),
           buyerUsername: (colBuyer !== -1 ? cols[colBuyer] : "") || "ebay_uk_buyer",
           saleDate: normalizeUkDateToIso(rawDateStr),
         });
+      }
+
+      // Sort rows so Newest Sale Date is always at the top
+      if (isSalesReport) {
+        rows.sort((a, b) => b.saleDate.localeCompare(a.saleDate));
       }
 
       return { mode: isSalesReport ? "SALE" : "STOCK", rows };
@@ -427,17 +478,18 @@
     // 3. DEEP-DIVE BUSINESS INTELLIGENCE ENGINE
     // ==========================================
     function calculateDeepAnalytics(db) {
-      const totalItems = db.inventory.length;
-      const activeItems = db.inventory.filter((i) => i.status === "ACTIVE");
-      const soldItems = db.inventory.filter((i) => i.status !== "ACTIVE");
+      // db.inventory holds ONLY active unsold stock; db.sales holds all sold items
+      const activeItems = db.inventory;
+      const soldCount = db.sales.length;
+      const totalItems = activeItems.length + soldCount;
 
       const activeConsigned = activeItems.filter((i) => i.acquisitionType === "CONSIGNMENT");
       const activeOwned = activeItems.filter((i) => i.acquisitionType === "OWNED_STOCK");
 
-      const activePortfolioValue = activeItems.reduce((a, i) => a + Number(i.listedPrice), 0);
-      const activeConsignedValue = activeConsigned.reduce((a, i) => a + Number(i.listedPrice), 0);
-      const activeOwnedRetailValue = activeOwned.reduce((a, i) => a + Number(i.listedPrice), 0);
-      const tiedUpOwnedCogs = activeOwned.reduce((a, i) => a + Number(i.acquisitionCost), 0);
+      const activePortfolioValue = activeItems.reduce((a, i) => a + Number(i.listedPrice || 0), 0);
+      const activeConsignedValue = activeConsigned.reduce((a, i) => a + Number(i.listedPrice || 0), 0);
+      const activeOwnedRetailValue = activeOwned.reduce((a, i) => a + Number(i.listedPrice || 0), 0);
+      const tiedUpOwnedCogs = activeOwned.reduce((a, i) => a + Number(i.acquisitionCost || 0), 0);
 
       let projectedActiveBusinessProfit = 0;
       activeItems.forEach((item) => {
@@ -448,19 +500,21 @@
           grossSalePrice: item.listedPrice,
           shippingChargedToBuyer: 0,
           platformFeeAmount: estFee,
+          adFeeAmount: 0,
           actualPostageCost: 0,
-          packagingCost: 1.25,
+          packagingCost: 0.85,
           acquisitionCost: item.acquisitionCost,
           consigneeSplitPercentage: consignee ? Number(consignee.defaultSplit) : 60,
         });
         projectedActiveBusinessProfit += estSplit.businessProfitShare;
       });
 
-      const sellThroughRate = totalItems > 0 ? Number(((soldItems.length / totalItems) * 100).toFixed(1)) : 0;
+      const sellThroughRate = totalItems > 0 ? Number(((soldCount / totalItems) * 100).toFixed(1)) : 0;
 
       let totalGrossSales = 0;
       let totalShippingCharged = 0;
       let totalPlatformFees = 0;
+      let totalAdFees = 0;
       let totalActualPostage = 0;
       let totalPackaging = 0;
       let totalSoldOwnedCogs = 0;
@@ -476,20 +530,22 @@
       const channelStats = {};
 
       db.sales.forEach((s) => {
-        const item = db.inventory.find((i) => i.id === s.inventoryItemId);
-        const g = Number(s.grossSalePrice);
-        const shipIn = Number(s.shippingChargedToBuyer);
-        const fee = Number(s.platformFeeAmount);
-        const postOut = Number(s.actualPostageCost);
-        const packOut = Number(s.packagingCost);
-        const cogs = Number(s.ownedStockCogs);
-        const net = Number(s.netProfit);
-        const biz = Number(s.businessProfitShare);
-        const con = Number(s.consigneePayoutAmount);
+        const g = Number(s.grossSalePrice || 0);
+        const shipIn = Number(s.shippingChargedToBuyer || 0);
+        const fee = Number(s.platformFeeAmount || 0);
+        const adFee = Number(s.adFeeAmount || 0);
+        const postOut = Number(s.actualPostageCost || 0);
+        const packOut = Number(s.packagingCost || 0);
+        const cogs = Number(s.ownedStockCogs || 0);
+        const net = Number(s.netProfit || 0);
+        const biz = Number(s.businessProfitShare || 0);
+        const con = Number(s.consigneePayoutAmount || 0);
+        const acqType = s.acquisitionType || "CONSIGNMENT";
 
         totalGrossSales += g;
         totalShippingCharged += shipIn;
         totalPlatformFees += fee;
+        totalAdFees += adFee;
         totalActualPostage += postOut;
         totalPackaging += packOut;
         totalSoldOwnedCogs += cogs;
@@ -497,14 +553,14 @@
         totalBusinessKeep += biz;
         totalConsigneeShare += con;
 
-        if (item?.acquisitionType === "CONSIGNMENT") {
+        if (acqType === "CONSIGNMENT") {
           consignmentSaleProfitTotal += biz;
         } else {
           ownedSaleProfitTotal += biz;
         }
 
-        if (item?.createdAt && s.saleDate) {
-          const d1 = new Date(normalizeUkDateToIso(item.createdAt));
+        if (s.listedDate && s.saleDate) {
+          const d1 = new Date(normalizeUkDateToIso(s.listedDate));
           const d2 = new Date(normalizeUkDateToIso(s.saleDate));
           const diffDays = Math.max(1, Math.round((d2 - d1) / (1000 * 60 * 60 * 24)));
           if (!isNaN(diffDays)) {
@@ -513,7 +569,7 @@
           }
         }
 
-        const cat = item?.category || "OTHER";
+        const cat = s.category || "OTHER";
         if (!categoryStats[cat]) {
           categoryStats[cat] = { category: cat, soldCount: 0, activeCount: 0, gross: 0, netProfit: 0, businessKeep: 0 };
         }
@@ -522,13 +578,14 @@
         categoryStats[cat].netProfit += net;
         categoryStats[cat].businessKeep += biz;
 
-        const plat = item?.platform || "EBAY";
+        const plat = s.platform || "EBAY";
         if (!channelStats[plat]) {
-          channelStats[plat] = { platform: plat, count: 0, gross: 0, fees: 0, businessKeep: 0 };
+          channelStats[plat] = { platform: plat, count: 0, gross: 0, fees: 0, adFees: 0, businessKeep: 0 };
         }
         channelStats[plat].count += 1;
         channelStats[plat].gross += g + shipIn;
         channelStats[plat].fees += fee;
+        channelStats[plat].adFees += adFee;
         channelStats[plat].businessKeep += biz;
       });
 
@@ -541,8 +598,11 @@
       });
 
       const totalTopLineIngoing = totalGrossSales + totalShippingCharged;
+      const combinedFeesAndAds = totalPlatformFees + totalAdFees;
       const feeBleedRatePercent =
-        totalTopLineIngoing > 0 ? Number(((totalPlatformFees / totalTopLineIngoing) * 100).toFixed(2)) : 0;
+        totalTopLineIngoing > 0 ? Number(((combinedFeesAndAds / totalTopLineIngoing) * 100).toFixed(2)) : 0;
+      const adBleedRatePercent =
+        totalTopLineIngoing > 0 ? Number(((totalAdFees / totalTopLineIngoing) * 100).toFixed(2)) : 0;
       const shippingRecoveryBalance = toGbp(
         (totalShippingCharged - (totalActualPostage + totalPackaging)) * 100
       );
@@ -551,11 +611,11 @@
       const businessKeepRatePercent =
         totalTopLineIngoing > 0 ? Number(((totalBusinessKeep / totalTopLineIngoing) * 100).toFixed(1)) : 0;
       const avgDaysToSell =
-        soldWithDatesCount > 0 ? Number((totalDaysToSell / soldWithDatesCount).toFixed(1)) : 6.5;
+        soldWithDatesCount > 0 ? Number((totalDaysToSell / soldWithDatesCount).toFixed(1)) : 0;
 
       const postageAndPackTotal = totalActualPostage + totalPackaging;
       const waterfall = {
-        feesPct: totalTopLineIngoing > 0 ? Number(((totalPlatformFees / totalTopLineIngoing) * 100).toFixed(1)) : 0,
+        feesPct: totalTopLineIngoing > 0 ? Number(((combinedFeesAndAds / totalTopLineIngoing) * 100).toFixed(1)) : 0,
         postagePackPct: totalTopLineIngoing > 0 ? Number(((postageAndPackTotal / totalTopLineIngoing) * 100).toFixed(1)) : 0,
         cogsPct: totalTopLineIngoing > 0 ? Number(((totalSoldOwnedCogs / totalTopLineIngoing) * 100).toFixed(1)) : 0,
         consigneePct: totalTopLineIngoing > 0 ? Number(((totalConsigneeShare / totalTopLineIngoing) * 100).toFixed(1)) : 0,
@@ -565,7 +625,7 @@
       const now = new Date();
       const agingInventory = activeItems
         .map((item) => {
-          const listedDate = new Date(normalizeUkDateToIso(item.createdAt || "2026-10-01"));
+          const listedDate = new Date(normalizeUkDateToIso(item.createdAt));
           const daysListed = Math.max(1, Math.round((now - listedDate) / (1000 * 60 * 60 * 24)));
           return { ...item, daysListed };
         })
@@ -573,18 +633,15 @@
 
       const consigneeLeaderboard = db.consignees
         .map((c) => {
-          const cItems = db.inventory.filter((i) => i.consigneeId === c.id);
-          const cSales = db.sales.filter((s) => {
-            const it = db.inventory.find((i) => i.id === s.inventoryItemId);
-            return it?.consigneeId === c.id;
-          });
-          const grossGenerated = cSales.reduce((a, s) => a + Number(s.grossSalePrice), 0);
-          const business40Earned = cSales.reduce((a, s) => a + Number(s.businessProfitShare), 0);
-          const consignee60Earned = cSales.reduce((a, s) => a + Number(s.consigneePayoutAmount), 0);
+          const cActiveItems = db.inventory.filter((i) => i.consigneeId === c.id);
+          const cSales = db.sales.filter((s) => s.consigneeId === c.id);
+          const grossGenerated = cSales.reduce((a, s) => a + Number(s.grossSalePrice || 0), 0);
+          const business40Earned = cSales.reduce((a, s) => a + Number(s.businessProfitShare || 0), 0);
+          const consignee60Earned = cSales.reduce((a, s) => a + Number(s.consigneePayoutAmount || 0), 0);
           return {
             id: c.id,
             name: c.name,
-            totalItems: cItems.length,
+            activeItemsCount: cActiveItems.length,
             soldCount: cSales.length,
             grossGenerated: toGbp(grossGenerated * 100),
             business40Earned: toGbp(business40Earned * 100),
@@ -596,7 +653,7 @@
       return {
         totalItems,
         activeCount: activeItems.length,
-        soldCount: soldItems.length,
+        soldCount,
         sellThroughRate,
         activePortfolioValue: toGbp(activePortfolioValue * 100),
         activeConsignedValue: toGbp(activeConsignedValue * 100),
@@ -607,11 +664,14 @@
         totalGrossSales: toGbp(totalGrossSales * 100),
         totalShippingCharged: toGbp(totalShippingCharged * 100),
         totalPlatformFees: toGbp(totalPlatformFees * 100),
+        totalAdFees: toGbp(totalAdFees * 100),
+        combinedFeesAndAds: toGbp(combinedFeesAndAds * 100),
         totalActualPostage: toGbp(totalActualPostage * 100),
         totalPackaging: toGbp(totalPackaging * 100),
         totalSoldOwnedCogs: toGbp(totalSoldOwnedCogs * 100),
         totalBusinessKeep: toGbp(totalBusinessKeep * 100),
         feeBleedRatePercent,
+        adBleedRatePercent,
         shippingRecoveryBalance,
         ownedStockRoiPercent,
         businessKeepRatePercent,
@@ -667,342 +727,16 @@
     }
 
     // ==========================================
-    // 5. SEED DATABASE
+    // 5. CLEAN EMPTY DATABASE (NO DEMO CLUTTER)
     // ==========================================
     const INITIAL_DATA = {
-      consignees: [
-        {
-          id: "con-1",
-          name: "Callum Fraser",
-          email: "callum.fraser@example.co.uk",
-          phone: "07700 900412",
-          address: "14 Victoria Road, Glasgow, G12 9BG",
-          bankDetails: "Sort: 04-00-04 | Acc: 84920114 (Monzo)",
-          defaultSplit: 60,
-          notes: "High-value Pokémon & Japanese TCG collector.",
-        },
-        {
-          id: "con-2",
-          name: "Sarah Jenkins",
-          email: "s.jenkins.lego@example.co.uk",
-          phone: "07700 900889",
-          address: "88 Abbey Lane, Sheffield, S8 0BN",
-          bankDetails: "Sort: 20-76-89 | Acc: 44192831 (Barclays)",
-          defaultSplit: 60,
-          notes: "Retired Star Wars UCS LEGO sets & sealed minifigures.",
-        },
-        {
-          id: "con-3",
-          name: "Marcus Vance",
-          email: "mvance.comics@example.co.uk",
-          phone: "07700 900155",
-          address: "42 Park Street, Bristol, BS1 5JG",
-          bankDetails: "Sort: 60-83-71 | Acc: 29104482 (Starling)",
-          defaultSplit: 60,
-          notes: "Hot Toys 1/6 Figures & CGC Graded Silver/Bronze Age Keys.",
-        },
-      ],
-      inventory: [
-        {
-          id: "inv-1",
-          sku: "TCG-PKM-001",
-          title: "1999 Pokémon Base Set Shadowless Charizard Holo — PSA 8",
-          category: "TRADING_CARDS",
-          acquisitionType: "CONSIGNMENT",
-          consigneeId: "con-1",
-          acquisitionCost: 0,
-          condition: "PSA 8 NM-MT",
-          storageLocation: "Vault A-01",
-          listedPrice: 1450.0,
-          status: "PAYOUT_PENDING",
-          platform: "EBAY",
-          platformItemId: "285910492811",
-          createdAt: "2026-09-12",
-        },
-        {
-          id: "inv-2",
-          sku: "LGO-SW-002",
-          title: "LEGO Star Wars 10179 UCS Millennium Falcon (First Edition, Complete)",
-          category: "LEGO",
-          acquisitionType: "CONSIGNMENT",
-          consigneeId: "con-2",
-          acquisitionCost: 0,
-          condition: "Used - 100% Complete w/ Box & COA",
-          storageLocation: "Rack LGO-04",
-          listedPrice: 980.0,
-          status: "PAYOUT_PENDING",
-          platform: "EBAY",
-          platformItemId: "285910884120",
-          createdAt: "2026-09-18",
-        },
-        {
-          id: "inv-3",
-          sku: "OWN-FUN-003",
-          title: "Funko Pop! Star Wars #01 Darth Vader (Blue Box Grails Lot of 4)",
-          category: "FUNKO_POP",
-          acquisitionType: "OWNED_STOCK",
-          consigneeId: null,
-          acquisitionCost: 115.0,
-          condition: "Mint w/ Hard Stacks",
-          storageLocation: "Shelf B-12",
-          listedPrice: 310.0,
-          status: "COMPLETED",
-          platform: "WHATNOT",
-          platformItemId: "WN-LIVE-882",
-          createdAt: "2026-09-20",
-        },
-        {
-          id: "inv-4",
-          sku: "FIG-HT-004",
-          title: "Hot Toys MMS678 Star Wars Darth Vader (Obi-Wan Series Deluxe 1/6)",
-          category: "ACTION_FIGURES",
-          acquisitionType: "CONSIGNMENT",
-          consigneeId: "con-3",
-          acquisitionCost: 0,
-          condition: "MISB Sealed Brown Shipper",
-          storageLocation: "Bay FIG-09",
-          listedPrice: 365.0,
-          status: "ACTIVE",
-          platform: "EBAY",
-          platformItemId: "285919002145",
-          createdAt: "2026-09-25",
-        },
-        {
-          id: "inv-5",
-          sku: "OWN-VG-005",
-          title: "Pokémon Emerald Version (GameBoy Advance, CIB UK PAL Boxed)",
-          category: "VIDEO_GAMES",
-          acquisitionType: "OWNED_STOCK",
-          consigneeId: null,
-          acquisitionCost: 140.0,
-          condition: "Very Good CIB - New Dry Battery",
-          storageLocation: "Vault B-03",
-          listedPrice: 329.99,
-          status: "ACTIVE",
-          platform: "EBAY",
-          platformItemId: "285920119044",
-          createdAt: "2026-10-01",
-        },
-        {
-          id: "inv-6",
-          sku: "TCG-PKM-006",
-          title: "Pokémon Umbreon VMAX Alt Art (Evolving Skies 215/203) — PSA 10",
-          category: "TRADING_CARDS",
-          acquisitionType: "CONSIGNMENT",
-          consigneeId: "con-1",
-          acquisitionCost: 0,
-          condition: "PSA 10 Gem Mint",
-          storageLocation: "Vault A-02",
-          listedPrice: 1150.0,
-          status: "ACTIVE",
-          platform: "CARDMARKET",
-          platformItemId: "CM-9940128",
-          createdAt: "2026-10-08",
-        },
-      ],
-      sales: [
-        {
-          id: "sale-1",
-          inventoryItemId: "inv-1",
-          saleDate: "2026-10-02",
-          buyerUsername: "uk_pokecollector99",
-          grossSalePrice: 1450.0,
-          shippingChargedToBuyer: 11.95,
-          platformFeeAmount: 162.5,
-          actualPostageCost: 11.15,
-          packagingCost: 3.3,
-          ownedStockCogs: 0,
-          netProfit: 1285.0,
-          businessProfitShare: 514.0,
-          consigneePayoutAmount: 771.0,
-          payoutStatus: "UNPAID",
-          payoutId: null,
-        },
-        {
-          id: "sale-2",
-          inventoryItemId: "inv-2",
-          saleDate: "2026-10-06",
-          buyerUsername: "brick_master_ldn",
-          grossSalePrice: 980.0,
-          shippingChargedToBuyer: 18.5,
-          platformFeeAmount: 112.4,
-          actualPostageCost: 19.8,
-          packagingCost: 6.3,
-          ownedStockCogs: 0,
-          netProfit: 860.0,
-          businessProfitShare: 344.0,
-          consigneePayoutAmount: 516.0,
-          payoutStatus: "UNPAID",
-          payoutId: null,
-        },
-        {
-          id: "sale-3",
-          inventoryItemId: "inv-3",
-          saleDate: "2026-09-29",
-          buyerUsername: "funko_vault_uk",
-          grossSalePrice: 310.0,
-          shippingChargedToBuyer: 6.99,
-          platformFeeAmount: 31.8,
-          actualPostageCost: 5.95,
-          packagingCost: 2.24,
-          ownedStockCogs: 115.0,
-          netProfit: 162.0,
-          businessProfitShare: 162.0,
-          consigneePayoutAmount: 0,
-          payoutStatus: "NOT_APPLICABLE",
-          payoutId: null,
-        },
-      ],
+      consignees: [],
+      inventory: [],
+      sales: [],
       payouts: [],
-      expenses: [
-        {
-          id: "exp-1",
-          expenseDate: "2026-09-15",
-          category: "STORAGE_AND_RENT",
-          merchant: "SafeStore UK Self Storage",
-          description: "Climate-controlled collector vault unit (Monthly)",
-          amount: 185.0,
-          isTaxDeductible: true,
-          allocatedToItemSale: false,
-          receiptName: "safestore-sep-2026.pdf",
-        },
-        {
-          id: "exp-2",
-          expenseDate: "2026-09-28",
-          category: "EVENT_TABLES_AND_TRAVEL",
-          merchant: "London Card Show",
-          description: "2x Vendor Exhibitor Tables + Insurance",
-          amount: 240.0,
-          isTaxDeductible: true,
-          allocatedToItemSale: false,
-          receiptName: "london-card-show-invoice.pdf",
-        },
-        {
-          id: "exp-3",
-          expenseDate: "2026-10-03",
-          category: "PLATFORM_SUBSCRIPTIONS",
-          merchant: "eBay UK Anchor Shop & CardLadder Pro",
-          description: "Monthly store subscription & market pricing tools",
-          amount: 74.99,
-          isTaxDeductible: true,
-          allocatedToItemSale: false,
-          receiptName: "ebay-sub-oct.pdf",
-        },
-      ],
-      cashFlow: [
-        {
-          id: "cf-1",
-          entryDate: "2026-09-15",
-          type: "OUTGOING",
-          source: "OPERATING_EXPENSE",
-          amount: 185.0,
-          description: "SafeStore UK Self Storage — Climate-controlled collector vault",
-        },
-        {
-          id: "cf-2",
-          entryDate: "2026-09-20",
-          type: "OUTGOING",
-          source: "OWNED_STOCK_ACQUISITION",
-          amount: 115.0,
-          description: "COGS Acquisition: [OWN-FUN-003] Funko Pop Darth Vader Lot",
-        },
-        {
-          id: "cf-3",
-          entryDate: "2026-09-28",
-          type: "OUTGOING",
-          source: "OPERATING_EXPENSE",
-          amount: 240.0,
-          description: "London Card Show — 2x Vendor Exhibitor Tables",
-        },
-        {
-          id: "cf-4",
-          entryDate: "2026-09-29",
-          type: "INGOING",
-          source: "SALE_GROSS_RECEIPT",
-          amount: 316.99,
-          description: "Gross Receipt: [OWN-FUN-003] Funko Pop! Star Wars Lot",
-          saleRecordId: "sale-3",
-        },
-        {
-          id: "cf-5",
-          entryDate: "2026-09-29",
-          type: "OUTGOING",
-          source: "PLATFORM_FEE_DEDUCTION",
-          amount: 39.99,
-          description: "Fees, Postage & Packaging: [OWN-FUN-003]",
-          saleRecordId: "sale-3",
-        },
-        {
-          id: "cf-6",
-          entryDate: "2026-10-02",
-          type: "INGOING",
-          source: "SALE_GROSS_RECEIPT",
-          amount: 1461.95,
-          description: "Gross Receipt: [TCG-PKM-001] 1999 Base Set Shadowless Charizard PSA 8",
-          saleRecordId: "sale-1",
-        },
-        {
-          id: "cf-7",
-          entryDate: "2026-10-02",
-          type: "OUTGOING",
-          source: "PLATFORM_FEE_DEDUCTION",
-          amount: 176.95,
-          description: "Fees, Postage & Packaging: [TCG-PKM-001]",
-          saleRecordId: "sale-1",
-        },
-        {
-          id: "cf-8",
-          entryDate: "2026-10-06",
-          type: "INGOING",
-          source: "SALE_GROSS_RECEIPT",
-          amount: 998.5,
-          description: "Gross Receipt: [LGO-SW-002] LEGO 10179 UCS Millennium Falcon",
-          saleRecordId: "sale-2",
-        },
-        {
-          id: "cf-9",
-          entryDate: "2026-10-06",
-          type: "OUTGOING",
-          source: "PLATFORM_FEE_DEDUCTION",
-          amount: 138.5,
-          description: "Fees, Postage & Packaging: [LGO-SW-002]",
-          saleRecordId: "sale-2",
-        },
-      ],
-      documents: [
-        {
-          id: "doc-1",
-          fileName: "callum-fraser-signed-60-40-contract.pdf",
-          documentType: "CONSIGNMENT_AGREEMENT",
-          linkedTo: "Consignee: Callum Fraser",
-          fileSize: "248 KB",
-          uploadedAt: "2026-09-10",
-        },
-        {
-          id: "doc-2",
-          fileName: "sarah-jenkins-signed-mandate.pdf",
-          documentType: "CONSIGNMENT_AGREEMENT",
-          linkedTo: "Consignee: Sarah Jenkins",
-          fileSize: "192 KB",
-          uploadedAt: "2026-09-14",
-        },
-        {
-          id: "doc-3",
-          fileName: "safestore-sep-2026.pdf",
-          documentType: "EXPENSE_RECEIPT",
-          linkedTo: "Expense: SafeStore UK Self Storage",
-          fileSize: "115 KB",
-          uploadedAt: "2026-09-15",
-        },
-        {
-          id: "doc-4",
-          fileName: "royal-mail-special-delivery-TCG-PKM-001.jpg",
-          documentType: "PROOF_OF_POSTAGE",
-          linkedTo: "Sale: TCG-PKM-001 (£11.15)",
-          fileSize: "840 KB",
-          uploadedAt: "2026-10-02",
-        },
-      ],
+      expenses: [],
+      cashFlow: [],
+      documents: [],
     };
     // ==========================================
     // 6. PIN PASSCODE LOCK SCREEN COMPONENT
@@ -1128,20 +862,25 @@
     }
 
     // ==========================================
-    // 7. EBAY UK CSV IMPORTER MODAL
+    // 7. EBAY UK CSV IMPORTER MODAL (WITH BULK FEE CONTROLS)
     // ==========================================
     const SAMPLE_EBAY_ACTIVE_CSV = `Item number,Title,Custom label (SKU),Start price,Condition
 2859331001,Pokemon 151 Charizard ex SIR 199/165 PSA 10 Gem Mint,TCG-PKM-101,£420.00,Graded - PSA 10
 2859331002,LEGO Star Wars 75367 Venator-Class Republic Attack Cruiser MISB,LGO-SW-102,£489.99,New Sealed
 2859331003,OWN-Funko Pop Marvel Ghost Rider #18 Metallic SDCC Exclusive,OWN-FUN-103,£260.00,Near Mint w/ Stack`;
 
-    const SAMPLE_EBAY_SALES_CSV = `Order number,Item number,Item title,Custom label (SKU),Buyer username,Sale date,Sold for,Postage and packaging,Final Value Fee - fixed,Final Value Fee - variable
-20-11492-88210,2859442001,Pokemon Rayquaza VMAX Alt Art 218/203 Evolving Skies PSA 10,TCG-PKM-201,poke_king_uk,2026-10-12,£540.00,£8.95,£0.30,£70.26
-20-11492-88214,2859442002,LEGO Lord of the Rings 10237 Tower of Orthanc Complete Boxed,LGO-LOTR-202,shire_bricks,2026-10-14,£345.00,£14.50,£0.30,£46.01`;
+    const SAMPLE_EBAY_SALES_CSV = `Order number,Item number,Item title,Custom label (SKU),Buyer username,Sale date,Sold for,Postage and packaging
+20-11492-88210,2859442001,Pokemon Rayquaza VMAX Alt Art 218/203 Evolving Skies PSA 10,TCG-PKM-201,poke_king_uk,16 Oct 2026,£540.00,£8.95
+20-11492-88214,2859442002,LEGO Lord of the Rings 10237 Tower of Orthanc Complete Boxed,LGO-LOTR-202,shire_bricks,18 Oct 2026,£345.00,£14.50`;
 
     function EbayCsvImportModal({ consignees, onClose, onImportRows }) {
       const [defaultAcqType, setDefaultAcqType] = useState("CONSIGNMENT");
-      const [defaultConsigneeId, setDefaultConsigneeId] = useState(consignees[0]?.id || "con-1");
+      const [defaultConsigneeId, setDefaultConsigneeId] = useState(consignees[0]?.id || "");
+      const [defaultFeePreset, setDefaultFeePreset] = useState("EBAY");
+      const [defaultAdPct, setDefaultAdPct] = useState(5.0);
+      const [defaultPostage, setDefaultPostage] = useState(3.29);
+      const [defaultPackaging, setDefaultPackaging] = useState(0.85);
+
       const [parsedRows, setParsedRows] = useState([]);
       const [reportMode, setReportMode] = useState("STOCK");
       const [sourceFileName, setSourceFileName] = useState("");
@@ -1153,7 +892,15 @@
         const reader = new FileReader();
         reader.onload = (evt) => {
           const text = evt.target.result;
-          const result = parseEbayCsvReport(text, defaultAcqType, defaultConsigneeId);
+          const result = parseEbayCsvReport(
+            text,
+            defaultAcqType,
+            defaultConsigneeId,
+            defaultFeePreset,
+            defaultAdPct,
+            defaultPostage,
+            defaultPackaging
+          );
           setReportMode(result.mode);
           setParsedRows(result.rows);
         };
@@ -1163,14 +910,44 @@
       const loadSampleCsv = (type) => {
         const sample = type === "SALES" ? SAMPLE_EBAY_SALES_CSV : SAMPLE_EBAY_ACTIVE_CSV;
         setSourceFileName(type === "SALES" ? "ebay-uk-orders-report-oct-2026.csv" : "ebay-uk-active-listings-oct-2026.csv");
-        const result = parseEbayCsvReport(sample, defaultAcqType, defaultConsigneeId);
+        const result = parseEbayCsvReport(
+          sample,
+          defaultAcqType,
+          defaultConsigneeId,
+          defaultFeePreset,
+          defaultAdPct,
+          defaultPostage,
+          defaultPackaging
+        );
         setReportMode(result.mode);
         setParsedRows(result.rows);
       };
 
       const updateRowField = (tempId, field, value) => {
         setParsedRows((prev) =>
-          prev.map((r) => (r.tempId === tempId ? { ...r, [field]: value } : r))
+          prev.map((r) => {
+            if (r.tempId !== tempId) return r;
+            const updated = { ...r, [field]: value };
+            if (field === "grossSalePrice" || field === "shippingChargedToBuyer") {
+              if (defaultFeePreset !== "CUSTOM") {
+                updated.platformFeeAmount = calculatePlatformFeeByPreset(
+                  defaultFeePreset,
+                  updated.grossSalePrice,
+                  updated.shippingChargedToBuyer
+                );
+              }
+              if (Number(defaultAdPct) > 0) {
+                updated.adFeeAmount = Number(
+                  (
+                    ((Number(updated.grossSalePrice) + Number(updated.shippingChargedToBuyer)) *
+                      Number(defaultAdPct)) /
+                    100
+                  ).toFixed(2)
+                );
+              }
+            }
+            return updated;
+          })
         );
       };
 
@@ -1180,10 +957,10 @@
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-4 mb-4">
               <div>
                 <h3 className="text-lg font-bold text-white">
-                  eBay UK Seller Hub CSV Importer (Stock & Sales Reports)
+                  eBay UK Seller Hub CSV Importer (Missing Fee Auto-Fill)
                 </h3>
                 <p className="text-xs text-slate-400">
-                  Upload your eBay Active Listings CSV or Orders CSV to auto-populate inventory and match sales
+                  Because eBay downloads omit ad fees and transaction fees, configure your UK defaults below to auto-calculate every row instantly
                 </p>
               </div>
               <button
@@ -1194,9 +971,10 @@
               </button>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4 bg-slate-950 p-3.5 rounded-xl border border-slate-800 text-xs">
+            {/* Auto-Fill Controls for eBay Missing Fees */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-4 bg-slate-950 p-3.5 rounded-xl border border-slate-800 text-xs">
               <div>
-                <label className="text-slate-400 block mb-1">Default Ownership for Imported Rows</label>
+                <label className="text-slate-400 block mb-1">Ownership Type</label>
                 <select
                   value={defaultAcqType}
                   onChange={(e) => setDefaultAcqType(e.target.value)}
@@ -1213,6 +991,7 @@
                   onChange={(e) => setDefaultConsigneeId(e.target.value)}
                   className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white"
                 >
+                  <option value="">-- None / Select Consignee --</option>
                   {consignees.map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name}
@@ -1221,39 +1000,98 @@
                 </select>
               </div>
               <div>
-                <label className="text-slate-400 block mb-1">Upload eBay CSV File</label>
+                <label className="text-slate-400 block mb-1">Transaction Fee Preset</label>
+                <select
+                  value={defaultFeePreset}
+                  onChange={(e) => setDefaultFeePreset(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-indigo-300 font-medium"
+                >
+                  {Object.entries(UK_PLATFORM_PRESETS).map(([key, cfg]) => (
+                    <option key={key} value={key}>
+                      {cfg.shortName}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-slate-400 block mb-1">Promoted Ad Fee % (e.g. 5%)</label>
                 <input
-                  type="file"
-                  accept=".csv,text/csv"
-                  onChange={handleFileUpload}
-                  className="w-full text-slate-300 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:bg-indigo-600 file:text-white file:font-medium text-xs"
+                  type="number"
+                  step="0.1"
+                  value={defaultAdPct}
+                  onChange={(e) => setDefaultAdPct(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-rose-300 font-semibold"
                 />
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 mb-4 text-xs">
-              <span className="text-slate-400">Quick Test Samples:</span>
-              <button
-                type="button"
-                onClick={() => loadSampleCsv("STOCK")}
-                className="bg-slate-800 hover:bg-slate-700 text-indigo-300 px-3 py-1.5 rounded-lg border border-slate-700 transition"
-              >
-                Load Sample Active Stock CSV
-              </button>
-              <button
-                type="button"
-                onClick={() => loadSampleCsv("SALES")}
-                className="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-3 py-1.5 rounded-lg border border-slate-700 transition"
-              >
-                Load Sample Sold Orders CSV
-              </button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4 bg-slate-950 p-3.5 rounded-xl border border-slate-800 text-xs">
+              <div>
+                <label className="text-slate-400 block mb-1">Default Actual Postage Cost (£)</label>
+                <select
+                  onChange={(e) => setDefaultPostage(Number(e.target.value))}
+                  defaultValue={3.29}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-slate-200 mb-1"
+                >
+                  {UK_POSTAGE_PRESETS.map((p, idx) => (
+                    <option key={idx} value={p.cost}>
+                      {p.label}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={defaultPostage}
+                  onChange={(e) => setDefaultPostage(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white"
+                />
+              </div>
+              <div>
+                <label className="text-slate-400 block mb-1">Default Packaging Cost (£)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={defaultPackaging}
+                  onChange={(e) => setDefaultPackaging(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white mt-1"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4 text-xs">
+              <div className="flex items-center gap-2">
+                <span className="text-slate-400">Upload CSV File:</span>
+                <input
+                  type="file"
+                  accept=".csv,text/csv"
+                  onChange={handleFileUpload}
+                  className="text-slate-300 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:bg-indigo-600 file:text-white file:font-medium text-xs"
+                />
+              </div>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => loadSampleCsv("STOCK")}
+                  className="bg-slate-800 hover:bg-slate-700 text-indigo-300 px-3 py-1.5 rounded-lg border border-slate-700"
+                >
+                  Load Sample Stock
+                </button>
+                <button
+                  type="button"
+                  onClick={() => loadSampleCsv("SALES")}
+                  className="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-3 py-1.5 rounded-lg border border-slate-700"
+                >
+                  Load Sample Sales
+                </button>
+              </div>
             </div>
 
             {parsedRows.length > 0 && (
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-semibold text-emerald-400">
-                    Detected Format: {reportMode === "SALE" ? "eBay Sold Orders Report (Auto-runs 60/40 Split & Matches Stock)" : "eBay Active Stock Report"} ({parsedRows.length} items)
+                    Ready to Import: {reportMode === "SALE" ? "eBay Sold Orders Report (Moves stock to sales & calculates net profit)" : "eBay Active Stock Report"} ({parsedRows.length} items)
                   </span>
                 </div>
 
@@ -1264,9 +1102,15 @@
                         <th className="py-2 px-2">SKU</th>
                         <th className="py-2 px-2">Title</th>
                         <th className="py-2 px-2">Price (£)</th>
-                        {reportMode === "SALE" && <th className="py-2 px-2">eBay Fee (£)</th>}
+                        {reportMode === "SALE" && (
+                          <>
+                            <th className="py-2 px-2">Tx Fee (£)</th>
+                            <th className="py-2 px-2">Ad Fee (£)</th>
+                            <th className="py-2 px-2">Postage (£)</th>
+                          </>
+                        )}
                         <th className="py-2 px-2">Ownership</th>
-                        <th className="py-2 px-2">Consignee / COGS</th>
+                        <th className="py-2 px-2">Consignee</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800">
@@ -1278,7 +1122,35 @@
                             {fmtGBP(r.mode === "SALE" ? r.grossSalePrice : r.listedPrice)}
                           </td>
                           {reportMode === "SALE" && (
-                            <td className="py-2 px-2 text-rose-300">-{fmtGBP(r.platformFeeAmount)}</td>
+                            <>
+                              <td className="py-2 px-2">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={r.platformFeeAmount}
+                                  onChange={(e) => updateRowField(r.tempId, "platformFeeAmount", Number(e.target.value))}
+                                  className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-rose-300 font-semibold"
+                                />
+                              </td>
+                              <td className="py-2 px-2">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={r.adFeeAmount}
+                                  onChange={(e) => updateRowField(r.tempId, "adFeeAmount", Number(e.target.value))}
+                                  className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-amber-300 font-semibold"
+                                />
+                              </td>
+                              <td className="py-2 px-2">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={r.actualPostageCost}
+                                  onChange={(e) => updateRowField(r.tempId, "actualPostageCost", Number(e.target.value))}
+                                  className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-slate-200"
+                                />
+                              </td>
+                            </>
                           )}
                           <td className="py-2 px-2">
                             <select
@@ -1297,6 +1169,7 @@
                                 onChange={(e) => updateRowField(r.tempId, "consigneeId", e.target.value)}
                                 className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] text-indigo-200"
                               >
+                                <option value="">-- Select --</option>
                                 {consignees.map((c) => (
                                   <option key={c.id} value={c.id}>
                                     {c.name}
@@ -1310,7 +1183,7 @@
                                 placeholder="COGS £"
                                 value={r.acquisitionCost}
                                 onChange={(e) => updateRowField(r.tempId, "acquisitionCost", Number(e.target.value))}
-                                className="w-24 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] text-amber-300"
+                                className="w-20 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] text-amber-300"
                               />
                             )}
                           </td>
@@ -1333,7 +1206,7 @@
                     onClick={() => onImportRows(parsedRows, sourceFileName)}
                     className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-4 py-2 rounded-lg shadow"
                   >
-                    Import {parsedRows.length} eBay Records into Platform
+                    Import {parsedRows.length} Records into Platform
                   </button>
                 </div>
               </div>
@@ -1342,42 +1215,57 @@
         </div>
       );
     }
-
     // ==========================================
-    // 8. RECORD SALE MODAL WITH UK FEE PRESETS
+    // 8. RECORD SALE MODAL (WITH AD FEE & 1-TAP UK POSTAGE)
     // ==========================================
-    function RecordSaleModal({ item, consignee, onClose, onConfirm }) {
+    function RecordSaleModal({ item, consignees, onClose, onConfirm }) {
       const initialPreset = UK_PLATFORM_PRESETS[item.platform] ? item.platform : "EBAY";
       const [preset, setPreset] = useState(initialPreset);
       const [gross, setGross] = useState(item.listedPrice);
-      const [shippingCharged, setShippingCharged] = useState(6.95);
+      const [shippingCharged, setShippingCharged] = useState(3.99);
       const [platformFee, setPlatformFee] = useState(() =>
-        calculatePlatformFeeByPreset(initialPreset, item.listedPrice, 6.95)
+        calculatePlatformFeeByPreset(initialPreset, item.listedPrice, 3.99)
       );
-      const [actualPostage, setActualPostage] = useState(6.45);
-      const [packagingCost, setPackagingCost] = useState(1.5);
+      const [adFeePct, setAdFeePct] = useState(0);
+      const [adFeeAmount, setAdFeeAmount] = useState(0);
+      const [actualPostage, setActualPostage] = useState(3.29);
+      const [packagingCost, setPackagingCost] = useState(0.85);
       const [buyerUsername, setBuyerUsername] = useState("");
+      const [saleDate, setSaleDate] = useState(new Date().toISOString().split("T")[0]);
       const [proofFileName, setProofFileName] = useState("");
+
+      const consignee = consignees.find((c) => c.id === item.consigneeId);
+
+      const recalcFees = (nextPreset, nextGross, nextShip, nextAdPct) => {
+        const g = Number(nextGross) || 0;
+        const s = Number(nextShip) || 0;
+        if (nextPreset !== "CUSTOM") {
+          setPlatformFee(calculatePlatformFeeByPreset(nextPreset, g, s));
+        }
+        if (nextAdPct !== "CUSTOM") {
+          setAdFeeAmount(Number((((g + s) * (Number(nextAdPct) || 0)) / 100).toFixed(2)));
+        }
+      };
 
       const handlePresetChange = (newPreset) => {
         setPreset(newPreset);
-        if (newPreset !== "CUSTOM") {
-          setPlatformFee(calculatePlatformFeeByPreset(newPreset, gross, shippingCharged));
-        }
+        recalcFees(newPreset, gross, shippingCharged, adFeePct);
       };
 
       const handleGrossChange = (val) => {
         setGross(val);
-        if (preset !== "CUSTOM") {
-          setPlatformFee(calculatePlatformFeeByPreset(preset, val, shippingCharged));
-        }
+        recalcFees(preset, val, shippingCharged, adFeePct);
       };
 
       const handleShippingChange = (val) => {
         setShippingCharged(val);
-        if (preset !== "CUSTOM") {
-          setPlatformFee(calculatePlatformFeeByPreset(preset, gross, val));
-        }
+        recalcFees(preset, gross, val, adFeePct);
+      };
+
+      const handleAdPctQuickTap = (pct) => {
+        setAdFeePct(pct);
+        const total = (Number(gross) || 0) + (Number(shippingCharged) || 0);
+        setAdFeeAmount(Number(((total * pct) / 100).toFixed(2)));
       };
 
       const splitPreview = useMemo(
@@ -1387,20 +1275,23 @@
             grossSalePrice: gross,
             shippingChargedToBuyer: shippingCharged,
             platformFeeAmount: platformFee,
+            adFeeAmount,
             actualPostageCost: actualPostage,
             packagingCost,
             acquisitionCost: item.acquisitionCost,
-            consigneeSplitPercentage: consignee ? consignee.defaultSplit : 60,
+            consigneeSplitPercentage: consignee ? Number(consignee.defaultSplit) : 60,
           }),
-        [item, consignee, gross, shippingCharged, platformFee, actualPostage, packagingCost]
+        [item, consignee, gross, shippingCharged, platformFee, adFeeAmount, actualPostage, packagingCost]
       );
 
       const handleSubmit = (e) => {
         e.preventDefault();
         onConfirm({
+          saleDate,
           grossSalePrice: Number(gross),
           shippingChargedToBuyer: Number(shippingCharged || 0),
           platformFeeAmount: Number(platformFee || 0),
+          adFeeAmount: Number(adFeeAmount || 0),
           actualPostageCost: Number(actualPostage || 0),
           packagingCost: Number(packagingCost || 0),
           buyerUsername: buyerUsername || "uk_collector_buyer",
@@ -1412,26 +1303,37 @@
         <div className="fixed inset-0 bg-black/75 z-50 flex items-center justify-center p-4 no-print">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 max-h-[92vh] overflow-y-auto">
             <h3 className="text-lg font-bold text-white mb-1">
-              Record Sale & Auto-Calculate UK Fees
+              Move Stock to Sold & Calculate 60/40 Split
             </h3>
             <p className="text-xs text-indigo-300 mb-4">
               [{item.sku}] {item.title} ({item.acquisitionType})
             </p>
 
             <form onSubmit={handleSubmit} className="space-y-3 text-sm">
-              <div>
-                <label className="text-xs text-slate-400">UK Platform Fee Preset</label>
-                <select
-                  value={preset}
-                  onChange={(e) => handlePresetChange(e.target.value)}
-                  className="w-full mt-1 bg-slate-950 border border-indigo-500/40 rounded-lg px-3 py-2 text-xs text-indigo-200 font-medium"
-                >
-                  {Object.entries(UK_PLATFORM_PRESETS).map(([key, cfg]) => (
-                    <option key={key} value={key}>
-                      {cfg.label}
-                    </option>
-                  ))}
-                </select>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-slate-400">UK Platform Fee Preset</label>
+                  <select
+                    value={preset}
+                    onChange={(e) => handlePresetChange(e.target.value)}
+                    className="w-full mt-1 bg-slate-950 border border-indigo-500/40 rounded-lg px-2.5 py-2 text-xs text-indigo-200 font-medium"
+                  >
+                    {Object.entries(UK_PLATFORM_PRESETS).map(([key, cfg]) => (
+                      <option key={key} value={key}>
+                        {cfg.shortName}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-400">Sale Date</label>
+                  <input
+                    type="date"
+                    value={saleDate}
+                    onChange={(e) => setSaleDate(e.target.value)}
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white"
+                  />
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -1443,11 +1345,11 @@
                     required
                     value={gross}
                     onChange={(e) => handleGrossChange(e.target.value)}
-                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-semibold"
                   />
                 </div>
                 <div>
-                  <label className="text-xs text-slate-400">Shipping Charged to Buyer (£)</label>
+                  <label className="text-xs text-slate-400">Postage Charged to Buyer (£)</label>
                   <input
                     type="number"
                     step="0.01"
@@ -1456,56 +1358,117 @@
                     className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
                   />
                 </div>
-                <div>
-                  <label className="text-xs text-slate-400">
-                    Platform Fee (£) {preset !== "CUSTOM" && "(Auto)"}
-                  </label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={platformFee}
-                    onChange={(e) => {
-                      setPreset("CUSTOM");
-                      setPlatformFee(e.target.value);
-                    }}
-                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300 font-semibold"
-                  />
+              </div>
+
+              {/* 1-Tap Ad Fee % Bar */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-slate-400">Promoted Listing / Ad Fee Quick Tap:</span>
+                  <div className="flex gap-1">
+                    {[0, 2, 5, 8, 10, 12].map((pct) => (
+                      <button
+                        key={pct}
+                        type="button"
+                        onClick={() => handleAdPctQuickTap(pct)}
+                        className={`px-2 py-0.5 rounded text-[11px] font-semibold ${
+                          adFeePct === pct
+                            ? "bg-amber-500 text-slate-950"
+                            : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                        }`}
+                      >
+                        {pct}%
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <div>
-                  <label className="text-xs text-slate-400">Actual Postage Cost (£)</label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={actualPostage}
-                    onChange={(e) => setActualPostage(e.target.value)}
-                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300"
-                  />
+                <div className="grid grid-cols-2 gap-3 mt-2">
+                  <div>
+                    <label className="text-[11px] text-slate-400">Transaction Fee (£)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={platformFee}
+                      onChange={(e) => {
+                        setPreset("CUSTOM");
+                        setPlatformFee(e.target.value);
+                      }}
+                      className="w-full mt-0.5 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-rose-300 font-semibold"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[11px] text-slate-400">Ad / Promoted Fee (£)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={adFeeAmount}
+                      onChange={(e) => {
+                        setAdFeePct("CUSTOM");
+                        setAdFeeAmount(e.target.value);
+                      }}
+                      className="w-full mt-0.5 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-amber-300 font-semibold"
+                    />
+                  </div>
                 </div>
-                <div>
-                  <label className="text-xs text-slate-400">Packaging Cost (£)</label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={packagingCost}
-                    onChange={(e) => setPackagingCost(e.target.value)}
-                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300"
-                  />
+              </div>
+
+              {/* 1-Tap UK Postage Bar */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                <label className="text-xs text-slate-400 block mb-1.5">
+                  1-Tap UK Royal Mail / Evri Actual Postage Cost:
+                </label>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {UK_POSTAGE_PRESETS.map((p, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => setActualPostage(p.cost)}
+                      className={`px-2 py-1 rounded text-[11px] font-medium border ${
+                        Number(actualPostage) === p.cost
+                          ? "bg-indigo-600 text-white border-indigo-500"
+                          : "bg-slate-900 text-slate-300 border-slate-800 hover:bg-slate-800"
+                      }`}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
                 </div>
-                <div>
-                  <label className="text-xs text-slate-400">Buyer Username</label>
-                  <input
-                    type="text"
-                    value={buyerUsername}
-                    onChange={(e) => setBuyerUsername(e.target.value)}
-                    placeholder="e.g. collector_uk88"
-                    className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
-                  />
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="text-[11px] text-slate-400">Actual Postage (£)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={actualPostage}
+                      onChange={(e) => setActualPostage(e.target.value)}
+                      className="w-full mt-0.5 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-rose-300"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[11px] text-slate-400">Packaging (£)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={packagingCost}
+                      onChange={(e) => setPackagingCost(e.target.value)}
+                      className="w-full mt-0.5 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-rose-300"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[11px] text-slate-400">Buyer Username</label>
+                    <input
+                      type="text"
+                      value={buyerUsername}
+                      onChange={(e) => setBuyerUsername(e.target.value)}
+                      placeholder="buyer_uk"
+                      className="w-full mt-0.5 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white"
+                    />
+                  </div>
                 </div>
               </div>
 
               <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-1.5 text-xs">
                 <div className="flex justify-between text-slate-400">
-                  <span>Net Profit After Fees & P&P:</span>
+                  <span>Net Profit (After Tx Fee, Ad Fee, Postage & Pack):</span>
                   <span className="font-bold text-white">{fmtGBP(splitPreview.netProfit)}</span>
                 </div>
                 <div className="flex justify-between text-indigo-300">
@@ -1528,9 +1491,9 @@
                 </button>
                 <button
                   type="submit"
-                  className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium px-4 py-2 rounded-lg"
+                  className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-4 py-2 rounded-lg"
                 >
-                  Confirm Sale & Log Cash-Flow
+                  Move to Sales & Log Cash-Flow
                 </button>
               </div>
             </form>
@@ -1538,8 +1501,9 @@
         </div>
       );
     }
+
     // ==========================================
-    // 9. MAIN APP STATE & HANDLERS
+    // 9. MAIN APP STATE, BULK IMPORTER & DELETE HANDLERS
     // ==========================================
     function App() {
       const [activePin, setActivePin] = useState(() => {
@@ -1624,18 +1588,18 @@
 
       // Inventory Filters
       const [stockFilterType, setStockFilterType] = useState("ALL");
-      const [stockFilterStatus, setStockFilterStatus] = useState("ALL");
       const [searchQuery, setSearchQuery] = useState("");
 
-      // Live Sandbox Calculator State
+      // Live Sandbox Calculator State (on Dashboard)
       const [calcType, setCalcType] = useState("CONSIGNMENT");
       const [calcPlatformPreset, setCalcPlatformPreset] = useState("EBAY");
-      const [calcGross, setCalcGross] = useState(250);
-      const [calcShipCharged, setCalcShipCharged] = useState(6.95);
-      const [calcFee, setCalcFee] = useState(() => calculatePlatformFeeByPreset("EBAY", 250, 6.95));
-      const [calcPostage, setCalcPostage] = useState(6.45);
-      const [calcPack, setCalcPack] = useState(1.3);
-      const [calcCogs, setCalcCogs] = useState(110);
+      const [calcGross, setCalcGross] = useState(100);
+      const [calcShipCharged, setCalcShipCharged] = useState(3.99);
+      const [calcFee, setCalcFee] = useState(() => calculatePlatformFeeByPreset("EBAY", 100, 3.99));
+      const [calcAdFee, setCalcAdFee] = useState(0);
+      const [calcPostage, setCalcPostage] = useState(3.29);
+      const [calcPack, setCalcPack] = useState(0.85);
+      const [calcCogs, setCalcCogs] = useState(40);
 
       const handleSandboxPresetChange = (nextPreset) => {
         setCalcPlatformPreset(nextPreset);
@@ -1665,11 +1629,12 @@
             grossSalePrice: calcGross,
             shippingChargedToBuyer: calcShipCharged,
             platformFeeAmount: calcFee,
+            adFeeAmount: calcAdFee,
             actualPostageCost: calcPostage,
             packagingCost: calcPack,
             acquisitionCost: calcCogs,
           }),
-        [calcType, calcGross, calcShipCharged, calcFee, calcPostage, calcPack, calcCogs]
+        [calcType, calcGross, calcShipCharged, calcFee, calcAdFee, calcPostage, calcPack, calcCogs]
       );
 
       // Deep Analytics & Financial Aggregations
@@ -1681,28 +1646,27 @@
         let unpaidConsignee60Liability = 0;
 
         db.sales.forEach((s) => {
-          const item = db.inventory.find((i) => i.id === s.inventoryItemId);
-          if (item?.acquisitionType === "CONSIGNMENT") {
-            consignment40Profit += Number(s.businessProfitShare);
+          if (s.acquisitionType === "CONSIGNMENT") {
+            consignment40Profit += Number(s.businessProfitShare || 0);
             if (s.payoutStatus === "UNPAID") {
-              unpaidConsignee60Liability += Number(s.consigneePayoutAmount);
+              unpaidConsignee60Liability += Number(s.consigneePayoutAmount || 0);
             }
           } else {
-            owned100Profit += Number(s.businessProfitShare);
+            owned100Profit += Number(s.businessProfitShare || 0);
           }
         });
 
         const deductibleOverheads = db.expenses
           .filter((e) => e.isTaxDeductible && !e.allocatedToItemSale)
-          .reduce((acc, e) => acc + Number(e.amount), 0);
+          .reduce((acc, e) => acc + Number(e.amount || 0), 0);
 
         const cashIngoings = db.cashFlow
           .filter((c) => c.type === "INGOING")
-          .reduce((acc, c) => acc + Number(c.amount), 0);
+          .reduce((acc, c) => acc + Number(c.amount || 0), 0);
 
         const cashOutgoings = db.cashFlow
           .filter((c) => c.type === "OUTGOING")
-          .reduce((acc, c) => acc + Number(c.amount), 0);
+          .reduce((acc, c) => acc + Number(c.amount || 0), 0);
 
         const totalBusinessSaleProfit = consignment40Profit + owned100Profit;
         const taxBreakdown = calculateUkTaxLiability(
@@ -1723,11 +1687,14 @@
         };
       }, [db, taxEntityMode]);
 
-      // Bulk eBay CSV Import Handler with Duplicate Prevention
+      // ==========================================
+      // BULK EBAY IMPORTER (STRICT STOCK VS SALES SEPARATION)
+      // ==========================================
       function handleBulkEbayImport(rows, fileName) {
-        const newInventory = [...db.inventory];
-        const newSales = [...db.sales];
-        const newCashFlow = [...db.cashFlow];
+        let updatedInventory = [...db.inventory];
+        const addedStock = [];
+        const addedSales = [];
+        const addedCashFlow = [];
         const newDocs = [...db.documents];
         const today = new Date().toISOString().split("T")[0];
 
@@ -1735,18 +1702,21 @@
           const isConsignment = r.acquisitionType === "CONSIGNMENT";
 
           if (r.mode === "STOCK") {
-            const existingIdx = newInventory.findIndex(
-              (i) => i.sku.toUpperCase() === r.sku.toUpperCase() || (r.platformItemId && i.platformItemId === r.platformItemId)
+            // ACTIVE STOCK REPORT: Goes ONLY into Inventory (Stock)
+            const existingIdx = updatedInventory.findIndex(
+              (i) =>
+                i.sku.toUpperCase() === r.sku.toUpperCase() ||
+                (r.platformItemId && i.platformItemId === r.platformItemId)
             );
             if (existingIdx !== -1) {
-              newInventory[existingIdx] = {
-                ...newInventory[existingIdx],
+              updatedInventory[existingIdx] = {
+                ...updatedInventory[existingIdx],
                 listedPrice: Number(r.listedPrice),
                 title: r.title,
                 condition: r.condition,
               };
             } else {
-              newInventory.unshift({
+              addedStock.push({
                 id: `inv-eb-${Date.now()}-${idx}`,
                 sku: r.sku,
                 title: r.title,
@@ -1764,88 +1734,95 @@
               });
             }
           } else {
-            let matchedInvIdx = newInventory.findIndex(
-              (i) => i.sku.toUpperCase() === r.sku.toUpperCase() || (r.platformItemId && i.platformItemId === r.platformItemId)
+            // SOLD ORDERS REPORT: Goes ONLY into Sales (and removes matching item from Stock if it was listed)
+            const matchedInvIdx = updatedInventory.findIndex(
+              (i) =>
+                i.sku.toUpperCase() === r.sku.toUpperCase() ||
+                (r.platformItemId && i.platformItemId === r.platformItemId)
             );
 
-            let invId;
+            let matchedStockItem = null;
             if (matchedInvIdx !== -1) {
-              invId = newInventory[matchedInvIdx].id;
-              newInventory[matchedInvIdx] = {
-                ...newInventory[matchedInvIdx],
-                status: isConsignment ? "PAYOUT_PENDING" : "COMPLETED",
-              };
-            } else {
-              invId = `inv-eb-sale-${Date.now()}-${idx}`;
-              newInventory.unshift({
-                id: invId,
-                sku: r.sku,
-                title: r.title,
-                category: r.category,
-                acquisitionType: r.acquisitionType,
-                consigneeId: isConsignment ? r.consigneeId : null,
-                acquisitionCost: isConsignment ? 0 : Number(r.acquisitionCost || 0),
-                condition: r.condition,
-                storageLocation: "Dispatched",
-                listedPrice: Number(r.grossSalePrice),
-                status: isConsignment ? "PAYOUT_PENDING" : "COMPLETED",
-                platform: "EBAY",
-                platformItemId: r.platformItemId,
-                createdAt: r.saleDate,
-              });
+              matchedStockItem = updatedInventory[matchedInvIdx];
+              updatedInventory.splice(matchedInvIdx, 1); // Remove from active stock!
             }
 
+            const finalAcqType = matchedStockItem ? matchedStockItem.acquisitionType : r.acquisitionType;
+            const finalConsigneeId =
+              finalAcqType === "CONSIGNMENT"
+                ? matchedStockItem?.consigneeId || r.consigneeId
+                : null;
+            const finalCogs =
+              finalAcqType === "OWNED_STOCK"
+                ? Number(matchedStockItem?.acquisitionCost ?? r.acquisitionCost ?? 0)
+                : 0;
+
+            const consigneeObj = db.consignees.find((c) => c.id === finalConsigneeId);
             const split = calculateSaleSplit({
-              acquisitionType: r.acquisitionType,
+              acquisitionType: finalAcqType,
               grossSalePrice: r.grossSalePrice,
               shippingChargedToBuyer: r.shippingChargedToBuyer,
               platformFeeAmount: r.platformFeeAmount,
+              adFeeAmount: r.adFeeAmount || 0,
               actualPostageCost: r.actualPostageCost,
               packagingCost: r.packagingCost,
-              acquisitionCost: r.acquisitionCost,
-              consigneeSplitPercentage: 60,
+              acquisitionCost: finalCogs,
+              consigneeSplitPercentage: consigneeObj ? Number(consigneeObj.defaultSplit) : 60,
             });
 
             const saleId = `sale-eb-${Date.now()}-${idx}`;
-            newSales.unshift({
+            addedSales.push({
               id: saleId,
-              inventoryItemId: invId,
+              sku: matchedStockItem?.sku || r.sku,
+              title: matchedStockItem?.title || r.title,
+              category: matchedStockItem?.category || r.category,
+              condition: matchedStockItem?.condition || r.condition,
+              storageLocation: matchedStockItem?.storageLocation || "Dispatched",
+              platform: "EBAY",
+              platformItemId: r.platformItemId,
+              acquisitionType: finalAcqType,
+              consigneeId: finalConsigneeId,
+              listedDate: matchedStockItem?.createdAt || r.saleDate,
               saleDate: r.saleDate,
               buyerUsername: r.buyerUsername,
               grossSalePrice: Number(r.grossSalePrice),
               shippingChargedToBuyer: Number(r.shippingChargedToBuyer),
               platformFeeAmount: Number(r.platformFeeAmount),
+              adFeeAmount: Number(r.adFeeAmount || 0),
               actualPostageCost: Number(r.actualPostageCost),
               packagingCost: Number(r.packagingCost),
-              ownedStockCogs: isConsignment ? 0 : Number(r.acquisitionCost || 0),
+              ownedStockCogs: finalCogs,
               netProfit: split.netProfit,
               businessProfitShare: split.businessProfitShare,
               consigneePayoutAmount: split.consigneePayoutAmount,
-              payoutStatus: isConsignment ? "UNPAID" : "NOT_APPLICABLE",
+              payoutStatus: finalAcqType === "CONSIGNMENT" ? "UNPAID" : "NOT_APPLICABLE",
               payoutId: null,
             });
 
-            newCashFlow.unshift({
+            addedCashFlow.push({
               id: `cf-eb-in-${Date.now()}-${idx}`,
               entryDate: r.saleDate,
               type: "INGOING",
               source: "SALE_GROSS_RECEIPT",
               amount: split.totalIngoing,
-              description: `eBay CSV Gross Receipt: [${r.sku}] ${r.title}`,
+              description: `eBay Sale Gross Receipt: [${r.sku}] ${r.title}`,
               saleRecordId: saleId,
             });
 
             const directOut = toGbp(
-              toPence(r.platformFeeAmount) + toPence(r.actualPostageCost) + toPence(r.packagingCost)
+              toPence(r.platformFeeAmount) +
+                toPence(r.adFeeAmount || 0) +
+                toPence(r.actualPostageCost) +
+                toPence(r.packagingCost)
             );
             if (directOut > 0) {
-              newCashFlow.unshift({
+              addedCashFlow.push({
                 id: `cf-eb-out-${Date.now()}-${idx}`,
                 entryDate: r.saleDate,
                 type: "OUTGOING",
                 source: "PLATFORM_FEE_DEDUCTION",
                 amount: directOut,
-                description: `eBay CSV Fees & P&P: [${r.sku}]`,
+                description: `Fees, Ad Fee & Postage: [${r.sku}]`,
                 saleRecordId: saleId,
               });
             }
@@ -1857,23 +1834,156 @@
             id: "doc-eb-" + Date.now(),
             fileName,
             documentType: "EBAY_CSV_REPORT",
-            linkedTo: `Bulk Import (${rows.length} rows)`,
-            fileSize: "142 KB",
+            linkedTo: `eBay Import (${rows.length} rows)`,
+            fileSize: "128 KB",
             uploadedAt: today,
           });
         }
 
+        const mergedInventory = [...addedStock, ...updatedInventory].sort((a, b) =>
+          (b.createdAt || "").localeCompare(a.createdAt || "")
+        );
+        const mergedSales = [...addedSales, ...db.sales].sort((a, b) =>
+          (b.saleDate || "").localeCompare(a.saleDate || "")
+        );
+        const mergedCashFlow = [...addedCashFlow, ...db.cashFlow].sort((a, b) =>
+          (b.entryDate || "").localeCompare(a.entryDate || "")
+        );
+
         setDb({
           ...db,
-          inventory: newInventory,
-          sales: newSales,
-          cashFlow: newCashFlow,
+          inventory: mergedInventory,
+          sales: mergedSales,
+          cashFlow: mergedCashFlow,
           documents: newDocs,
         });
         setShowEbayImportModal(false);
       }
+
       // ==========================================
-      // 10. STANDARD CRUD, VOID SALE & EXPORT HANDLERS
+      // INLINE LIVE EDITOR FOR SALES FEES & POSTAGE
+      // ==========================================
+      function handleInlineSaleUpdate(saleId, field, rawVal) {
+        const updatedSales = db.sales.map((s) => {
+          if (s.id !== saleId) return s;
+          const updated = {
+            ...s,
+            [field]: field === "consigneeId" || field === "acquisitionType" ? rawVal : Number(rawVal || 0),
+          };
+          if (field === "acquisitionType" && rawVal === "OWNED_STOCK") {
+            updated.consigneeId = null;
+          }
+          const consigneeObj = db.consignees.find((c) => c.id === updated.consigneeId);
+          const split = calculateSaleSplit({
+            acquisitionType: updated.acquisitionType,
+            grossSalePrice: updated.grossSalePrice,
+            shippingChargedToBuyer: updated.shippingChargedToBuyer,
+            platformFeeAmount: updated.platformFeeAmount,
+            adFeeAmount: updated.adFeeAmount || 0,
+            actualPostageCost: updated.actualPostageCost,
+            packagingCost: updated.packagingCost,
+            acquisitionCost: updated.ownedStockCogs || 0,
+            consigneeSplitPercentage: consigneeObj ? Number(consigneeObj.defaultSplit) : 60,
+          });
+
+          return {
+            ...updated,
+            netProfit: split.netProfit,
+            businessProfitShare: split.businessProfitShare,
+            consigneePayoutAmount: split.consigneePayoutAmount,
+            payoutStatus:
+              updated.payoutStatus === "PAID"
+                ? "PAID"
+                : updated.acquisitionType === "CONSIGNMENT"
+                ? "UNPAID"
+                : "NOT_APPLICABLE",
+          };
+        });
+
+        const targetSale = updatedSales.find((s) => s.id === saleId);
+        const newDirectOut = targetSale
+          ? toGbp(
+              toPence(targetSale.platformFeeAmount) +
+                toPence(targetSale.adFeeAmount || 0) +
+                toPence(targetSale.actualPostageCost) +
+                toPence(targetSale.packagingCost)
+            )
+          : 0;
+
+        const updatedCashFlow = db.cashFlow.map((cf) => {
+          if (cf.saleRecordId === saleId && cf.source === "PLATFORM_FEE_DEDUCTION") {
+            return { ...cf, amount: newDirectOut };
+          }
+          return cf;
+        });
+
+        setDb({ ...db, sales: updatedSales, cashFlow: updatedCashFlow });
+      }
+
+      // ==========================================
+      // UNIVERSAL DELETE HANDLERS
+      // ==========================================
+      function handleDeleteStockItem(itemId) {
+        if (!confirm("Delete this item from Stock permanently?")) return;
+        setDb({
+          ...db,
+          inventory: db.inventory.filter((i) => i.id !== itemId),
+        });
+      }
+
+      function handleDeleteSaleRecord(saleId) {
+        if (!confirm("Delete this Sale record and its linked Cash-Flow entries permanently?")) return;
+        setDb({
+          ...db,
+          sales: db.sales.filter((s) => s.id !== saleId),
+          cashFlow: db.cashFlow.filter((cf) => cf.saleRecordId !== saleId),
+        });
+      }
+
+      function handleDeleteConsignee(consigneeId) {
+        const c = db.consignees.find((x) => x.id === consigneeId);
+        if (!confirm(`Delete consignee "${c?.name || "Account"}"?`)) return;
+        setDb({
+          ...db,
+          consignees: db.consignees.filter((x) => x.id !== consigneeId),
+        });
+      }
+
+      function handleDeleteExpense(expenseId) {
+        if (!confirm("Delete this Expense and its Cash-Flow entry?")) return;
+        setDb({
+          ...db,
+          expenses: db.expenses.filter((e) => e.id !== expenseId),
+          cashFlow: db.cashFlow.filter((cf) => cf.expenseId !== expenseId),
+        });
+      }
+
+      function handleDeleteCashFlowEntry(cfId) {
+        if (!confirm("Delete this Cash-Flow entry?")) return;
+        setDb({
+          ...db,
+          cashFlow: db.cashFlow.filter((cf) => cf.id !== cfId),
+        });
+      }
+
+      function handleDeleteDocument(docId) {
+        if (!confirm("Delete this Document record from the vault?")) return;
+        setDb({
+          ...db,
+          documents: db.documents.filter((d) => d.id !== docId),
+        });
+      }
+
+      function handleDeletePayout(payoutId) {
+        if (!confirm("Delete this Payout statement record?")) return;
+        setDb({
+          ...db,
+          payouts: db.payouts.filter((p) => p.id !== payoutId),
+          cashFlow: db.cashFlow.filter((cf) => cf.payoutId !== payoutId),
+        });
+      }
+      // ==========================================
+      // 10. STANDARD CRUD, MOVE-TO-SALES & EXPORT HANDLERS
       // ==========================================
       function handleAddStock(e) {
         e.preventDefault();
@@ -1883,7 +1993,7 @@
         const acquisitionCost = acquisitionType === "OWNED_STOCK" ? Number(fd.get("acquisitionCost") || 0) : 0;
 
         if (acquisitionType === "CONSIGNMENT" && !consigneeId) {
-          alert("Please select a Consignee for Consignment stock.");
+          alert("Please create or select a Consignee first for Consignment stock.");
           return;
         }
 
@@ -1917,7 +2027,11 @@
           });
         }
 
-        setDb({ ...db, inventory: [newItem, ...db.inventory], cashFlow: newCashFlow });
+        setDb({
+          ...db,
+          inventory: [newItem, ...db.inventory],
+          cashFlow: newCashFlow,
+        });
         setShowAddStockModal(false);
       }
 
@@ -1948,11 +2062,14 @@
         setEditingItem(null);
       }
 
+      // MOVES ITEM OUT OF STOCK AND INTO SALES (SORTED NEWEST FIRST)
       function handleConfirmRecordSale(saleData) {
         const {
+          saleDate,
           grossSalePrice,
           shippingChargedToBuyer,
           platformFeeAmount,
+          adFeeAmount,
           actualPostageCost,
           packagingCost,
           buyerUsername,
@@ -1965,6 +2082,7 @@
           grossSalePrice,
           shippingChargedToBuyer,
           platformFeeAmount,
+          adFeeAmount: adFeeAmount || 0,
           actualPostageCost,
           packagingCost,
           acquisitionCost: saleModalItem.acquisitionCost,
@@ -1972,17 +2090,27 @@
         });
 
         const isConsignment = saleModalItem.acquisitionType === "CONSIGNMENT";
-        const today = new Date().toISOString().split("T")[0];
+        const cleanSaleDate = normalizeUkDateToIso(saleDate);
         const saleId = "sale-" + Date.now();
 
         const newSale = {
           id: saleId,
-          inventoryItemId: saleModalItem.id,
-          saleDate: today,
+          sku: saleModalItem.sku,
+          title: saleModalItem.title,
+          category: saleModalItem.category,
+          condition: saleModalItem.condition,
+          storageLocation: saleModalItem.storageLocation,
+          platform: saleModalItem.platform,
+          platformItemId: saleModalItem.platformItemId,
+          acquisitionType: saleModalItem.acquisitionType,
+          consigneeId: saleModalItem.consigneeId,
+          listedDate: saleModalItem.createdAt,
+          saleDate: cleanSaleDate,
           buyerUsername,
           grossSalePrice,
           shippingChargedToBuyer,
           platformFeeAmount,
+          adFeeAmount: Number(adFeeAmount || 0),
           actualPostageCost,
           packagingCost,
           ownedStockCogs: isConsignment ? 0 : Number(saleModalItem.acquisitionCost),
@@ -1993,16 +2121,13 @@
           payoutId: null,
         };
 
-        const updatedInventory = db.inventory.map((item) =>
-          item.id === saleModalItem.id
-            ? { ...item, status: isConsignment ? "PAYOUT_PENDING" : "COMPLETED" }
-            : item
-        );
+        // Remove sold item from active stock so it lives strictly in Sales
+        const remainingInventory = db.inventory.filter((item) => item.id !== saleModalItem.id);
 
         const newCashFlow = [
           {
             id: "cf-in-" + Date.now(),
-            entryDate: today,
+            entryDate: cleanSaleDate,
             type: "INGOING",
             source: "SALE_GROSS_RECEIPT",
             amount: split.totalIngoing,
@@ -2013,16 +2138,19 @@
         ];
 
         const directOutgoings = toGbp(
-          toPence(platformFeeAmount) + toPence(actualPostageCost) + toPence(packagingCost)
+          toPence(platformFeeAmount) +
+            toPence(adFeeAmount || 0) +
+            toPence(actualPostageCost) +
+            toPence(packagingCost)
         );
         if (directOutgoings > 0) {
           newCashFlow.unshift({
             id: "cf-out-" + (Date.now() + 1),
-            entryDate: today,
+            entryDate: cleanSaleDate,
             type: "OUTGOING",
             source: "PLATFORM_FEE_DEDUCTION",
             amount: directOutgoings,
-            description: `Fees, Postage & Packaging: [${saleModalItem.sku}]`,
+            description: `Tx Fee, Ad Fee, Postage & Pack: [${saleModalItem.sku}]`,
             saleRecordId: saleId,
           });
         }
@@ -2035,52 +2163,73 @@
             documentType: "PROOF_OF_POSTAGE",
             linkedTo: `Sale: ${saleModalItem.sku} (${fmtGBP(actualPostageCost)})`,
             fileSize: "410 KB",
-            uploadedAt: today,
+            uploadedAt: cleanSaleDate,
           });
         }
 
+        const sortedSales = [newSale, ...db.sales].sort((a, b) =>
+          (b.saleDate || "").localeCompare(a.saleDate || "")
+        );
+        const sortedCashFlow = newCashFlow.sort((a, b) =>
+          (b.entryDate || "").localeCompare(a.entryDate || "")
+        );
+
         setDb({
           ...db,
-          inventory: updatedInventory,
-          sales: [newSale, ...db.sales],
-          cashFlow: newCashFlow,
+          inventory: remainingInventory,
+          sales: sortedSales,
+          cashFlow: sortedCashFlow,
           documents: newDocs,
         });
         setSaleModalItem(null);
       }
 
+      // VOIDS A SALE AND MOVES THE ITEM BACK INTO ACTIVE STOCK
       function handleVoidSale(saleId) {
         const targetSale = db.sales.find((s) => s.id === saleId);
         if (!targetSale) return;
         if (targetSale.payoutStatus === "PAID") {
-          alert("This sale has already been settled in a Consignee Payout batch and cannot be voided.");
+          alert("This sale has already been settled in a Consignee Payout batch. Delete the Payout first if you need to void it.");
           return;
         }
-        const item = db.inventory.find((i) => i.id === targetSale.inventoryItemId);
         if (
           !confirm(
-            `Void & Refund sale of [${item?.sku || "Item"}]?\nThis will restore the item to ACTIVE stock and remove its sale & fee cash-flow entries.`
+            `Return [${targetSale.sku}] back to Active Stock?\nThis will remove it from Sales and delete its linked Cash-Flow entries.`
           )
         ) {
           return;
         }
 
+        const restoredStockItem = {
+          id: "inv-restored-" + Date.now(),
+          sku: targetSale.sku || "SKU-RESTORED",
+          title: targetSale.title || "Restored Item",
+          category: targetSale.category || "TRADING_CARDS",
+          acquisitionType: targetSale.acquisitionType || "CONSIGNMENT",
+          consigneeId: targetSale.consigneeId || null,
+          acquisitionCost: Number(targetSale.ownedStockCogs || 0),
+          condition: targetSale.condition || "Collector Grade",
+          storageLocation: targetSale.storageLocation || "Vault A-01",
+          listedPrice: Number(targetSale.grossSalePrice || 0),
+          status: "ACTIVE",
+          platform: targetSale.platform || "EBAY",
+          platformItemId: targetSale.platformItemId || "N/A",
+          createdAt: targetSale.listedDate || new Date().toISOString().split("T")[0],
+        };
+
         setDb({
           ...db,
           sales: db.sales.filter((s) => s.id !== saleId),
-          inventory: db.inventory.map((i) =>
-            i.id === targetSale.inventoryItemId ? { ...i, status: "ACTIVE" } : i
-          ),
+          inventory: [restoredStockItem, ...db.inventory],
           cashFlow: db.cashFlow.filter((cf) => cf.saleRecordId !== saleId),
         });
       }
 
       function handleSettleConsigneePayout(consigneeId) {
         const consignee = db.consignees.find((c) => c.id === consigneeId);
-        const unpaidSales = db.sales.filter((s) => {
-          const item = db.inventory.find((i) => i.id === s.inventoryItemId);
-          return s.payoutStatus === "UNPAID" && item?.consigneeId === consigneeId;
-        });
+        const unpaidSales = db.sales.filter(
+          (s) => s.payoutStatus === "UNPAID" && s.consigneeId === consigneeId
+        );
 
         if (unpaidSales.length === 0) return;
 
@@ -2096,24 +2245,25 @@
         const today = new Date().toISOString().split("T")[0];
         const payoutNumber = `PO-2026-${String(db.payouts.length + 101).padStart(4, "0")}`;
 
-        const lineItems = unpaidSales.map((s) => {
-          const item = db.inventory.find((i) => i.id === s.inventoryItemId);
-          return {
-            sku: item?.sku || "SKU",
-            title: item?.title || "Item",
-            saleDate: s.saleDate,
-            grossPlusShipping: toGbp(toPence(s.grossSalePrice) + toPence(s.shippingChargedToBuyer)),
-            deductions: toGbp(
-              toPence(s.platformFeeAmount) + toPence(s.actualPostageCost) + toPence(s.packagingCost)
-            ),
-            netProfit: s.netProfit,
-            consigneeShare60: s.consigneePayoutAmount,
-            businessShare40: s.businessProfitShare,
-          };
-        });
+        const lineItems = unpaidSales.map((s) => ({
+          sku: s.sku || "SKU",
+          title: s.title || "Item",
+          saleDate: s.saleDate,
+          grossPlusShipping: toGbp(toPence(s.grossSalePrice) + toPence(s.shippingChargedToBuyer)),
+          deductions: toGbp(
+            toPence(s.platformFeeAmount) +
+              toPence(s.adFeeAmount || 0) +
+              toPence(s.actualPostageCost) +
+              toPence(s.packagingCost)
+          ),
+          netProfit: s.netProfit,
+          consigneeShare60: s.consigneePayoutAmount,
+          businessShare40: s.businessProfitShare,
+        }));
 
+        const payoutId = "po-" + Date.now();
         const newPayout = {
-          id: "po-" + Date.now(),
+          id: payoutId,
           payoutNumber,
           consigneeId,
           consigneeName: consignee.name,
@@ -2126,15 +2276,11 @@
         };
 
         const unpaidSaleIds = new Set(unpaidSales.map((s) => s.id));
-        const unpaidItemIds = new Set(unpaidSales.map((s) => s.inventoryItemId));
 
         setDb({
           ...db,
           sales: db.sales.map((s) =>
-            unpaidSaleIds.has(s.id) ? { ...s, payoutStatus: "PAID", payoutId: newPayout.id } : s
-          ),
-          inventory: db.inventory.map((i) =>
-            unpaidItemIds.has(i.id) ? { ...i, status: "COMPLETED" } : i
+            unpaidSaleIds.has(s.id) ? { ...s, payoutStatus: "PAID", payoutId } : s
           ),
           payouts: [newPayout, ...db.payouts],
           cashFlow: [
@@ -2145,6 +2291,7 @@
               source: "CONSIGNEE_PAYOUT",
               amount: totalPayout,
               description: `Consignee 60% Payout ${payoutNumber} to ${consignee.name} (Ref: ${paymentRef})`,
+              payoutId,
             },
             ...db.cashFlow,
           ],
@@ -2192,7 +2339,7 @@
           });
         }
 
-        setDb({ ...db, consignees: [...db.consignees, newConsignee], documents: newDocs });
+        setDb({ ...db, consignees: [newConsignee, ...db.consignees], documents: newDocs });
         setShowAddConsigneeModal(false);
       }
 
@@ -2206,12 +2353,13 @@
         const category = fd.get("category") || "OTHER";
         const allocatedToItemSale = fd.get("allocatedToItemSale") === "on";
         const receiptFile = fd.get("receiptFile")?.name || "expense-receipt.pdf";
+        const expId = "exp-" + Date.now();
 
         setDb({
           ...db,
           expenses: [
             {
-              id: "exp-" + Date.now(),
+              id: expId,
               expenseDate,
               category,
               merchant,
@@ -2222,7 +2370,7 @@
               receiptName: receiptFile,
             },
             ...db.expenses,
-          ],
+          ].sort((a, b) => (b.expenseDate || "").localeCompare(a.expenseDate || "")),
           cashFlow: [
             {
               id: "cf-exp-" + Date.now(),
@@ -2231,9 +2379,10 @@
               source: "OPERATING_EXPENSE",
               amount,
               description: `${merchant} — ${description}`,
+              expenseId: expId,
             },
             ...db.cashFlow,
-          ],
+          ].sort((a, b) => (b.entryDate || "").localeCompare(a.entryDate || "")),
           documents: [
             {
               id: "doc-exp-" + Date.now(),
@@ -2258,7 +2407,8 @@
           "Consignee Name",
           "Gross Sale (GBP)",
           "Shipping Charged (GBP)",
-          "Platform Fees (GBP)",
+          "Transaction Fee (GBP)",
+          "Promoted Ad Fee (GBP)",
           "Actual Postage (GBP)",
           "Packaging Cost (GBP)",
           "Owned Stock COGS (GBP)",
@@ -2268,24 +2418,24 @@
           "Payout Status",
         ];
 
-        const rows = db.sales.map((s) => {
-          const item = db.inventory.find((i) => i.id === s.inventoryItemId);
-          const consignee = db.consignees.find((c) => c.id === item?.consigneeId);
+        const rows = sortedSales.map((s) => {
+          const consignee = db.consignees.find((c) => c.id === s.consigneeId);
           return [
             s.saleDate,
-            item?.sku || "",
-            `"${(item?.title || "").replace(/"/g, '""')}"`,
-            item?.acquisitionType || "",
+            s.sku || "",
+            `"${(s.title || "").replace(/"/g, '""')}"`,
+            s.acquisitionType || "",
             `"${consignee ? consignee.name : "N/A - Owned Stock"}"`,
-            Number(s.grossSalePrice).toFixed(2),
-            Number(s.shippingChargedToBuyer).toFixed(2),
-            Number(s.platformFeeAmount).toFixed(2),
-            Number(s.actualPostageCost).toFixed(2),
-            Number(s.packagingCost).toFixed(2),
-            Number(s.ownedStockCogs).toFixed(2),
-            Number(s.netProfit).toFixed(2),
-            Number(s.consigneePayoutAmount).toFixed(2),
-            Number(s.businessProfitShare).toFixed(2),
+            Number(s.grossSalePrice || 0).toFixed(2),
+            Number(s.shippingChargedToBuyer || 0).toFixed(2),
+            Number(s.platformFeeAmount || 0).toFixed(2),
+            Number(s.adFeeAmount || 0).toFixed(2),
+            Number(s.actualPostageCost || 0).toFixed(2),
+            Number(s.packagingCost || 0).toFixed(2),
+            Number(s.ownedStockCogs || 0).toFixed(2),
+            Number(s.netProfit || 0).toFixed(2),
+            Number(s.consigneePayoutAmount || 0).toFixed(2),
+            Number(s.businessProfitShare || 0).toFixed(2),
             s.payoutStatus,
           ];
         });
@@ -2328,27 +2478,33 @@
         reader.readAsText(file);
       }
 
-      function resetDemoData() {
-        if (confirm("Reset all records back to the original demo dataset?")) {
+      function clearAllPlatformData() {
+        if (confirm("Are you sure you want to wipe ALL data and start with a blank database?")) {
           setDb(INITIAL_DATA);
         }
       }
 
+      // Always sort Stock and Sales with Newest at the Top
       const filteredInventory = useMemo(() => {
-        return db.inventory.filter((item) => {
-          if (stockFilterType !== "ALL" && item.acquisitionType !== stockFilterType) return false;
-          if (stockFilterStatus !== "ALL" && item.status !== stockFilterStatus) return false;
-          if (
-            searchQuery &&
-            !item.title.toLowerCase().includes(searchQuery.toLowerCase()) &&
-            !item.sku.toLowerCase().includes(searchQuery.toLowerCase()) &&
-            !(item.storageLocation || "").toLowerCase().includes(searchQuery.toLowerCase())
-          ) {
-            return false;
-          }
-          return true;
-        });
-      }, [db.inventory, stockFilterType, stockFilterStatus, searchQuery]);
+        return [...db.inventory]
+          .filter((item) => {
+            if (stockFilterType !== "ALL" && item.acquisitionType !== stockFilterType) return false;
+            if (
+              searchQuery &&
+              !item.title.toLowerCase().includes(searchQuery.toLowerCase()) &&
+              !item.sku.toLowerCase().includes(searchQuery.toLowerCase()) &&
+              !(item.storageLocation || "").toLowerCase().includes(searchQuery.toLowerCase())
+            ) {
+              return false;
+            }
+            return true;
+          })
+          .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+      }, [db.inventory, stockFilterType, searchQuery]);
+
+      const sortedSales = useMemo(() => {
+        return [...db.sales].sort((a, b) => (b.saleDate || "").localeCompare(a.saleDate || ""));
+      }, [db.sales]);
 
       if (!isUnlocked) {
         return <PinLockScreen activePin={activePin} onUnlock={handleUnlockSuccess} />;
@@ -2377,7 +2533,7 @@
                       </button>
                     </div>
                     <p className="text-xs text-slate-400">
-                      eBay Auto-Importer • Deep BI Analytics • 60/40 Split & UK HMRC Tax
+                      eBay Auto-Importer • Inline Fee Editor • 60/40 Split & UK HMRC Tax
                     </p>
                   </div>
                 </div>
@@ -2405,7 +2561,7 @@
                     { id: "ANALYTICS", label: "📊 Deep Analytics" },
                     { id: "INVENTORY", label: `Stock (${db.inventory.length})` },
                     { id: "SALES", label: `Sales (${db.sales.length})` },
-                    { id: "CONSIGNEES", label: "Consignees" },
+                    { id: "CONSIGNEES", label: `Consignees (${db.consignees.length})` },
                     { id: "EXPENSES", label: "Cash-Flow" },
                     { id: "TAX_DOCS", label: "UK Tax & Docs" },
                   ].map((tab) => (
@@ -2495,7 +2651,7 @@
 
               <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
                 <div className="flex items-center justify-between text-xs text-slate-400">
-                  <span>Active Portfolio Retail Value</span>
+                  <span>Active Stock Retail Value</span>
                   <span className="text-sky-400 font-semibold">Est. Share: {fmtGBP(deepStats.projectedActiveBusinessProfit)}</span>
                 </div>
                 <p className="text-2xl font-bold text-sky-300 mt-1.5">
@@ -2516,7 +2672,7 @@
                   <div className="flex items-center justify-between mb-3">
                     <div>
                       <h2 className="text-base font-bold text-white">Live 60/40 Profit-Split Calculator</h2>
-                      <p className="text-xs text-slate-400">Auto-calculates UK platform fees & 60/40 split</p>
+                      <p className="text-xs text-slate-400">Test fees, ad fees & postage before listing</p>
                     </div>
                     <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs">
                       <button
@@ -2576,7 +2732,7 @@
                     </div>
                     <div>
                       <label className="text-xs text-slate-400">
-                        Platform Fee (£) {calcPlatformPreset !== "CUSTOM" && "(Auto)"}
+                        Transaction Fee (£) {calcPlatformPreset !== "CUSTOM" && "(Auto)"}
                       </label>
                       <input
                         type="number"
@@ -2587,6 +2743,16 @@
                           setCalcFee(e.target.value);
                         }}
                         className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-rose-300 font-semibold"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-slate-400">Promoted Ad Fee (£)</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={calcAdFee}
+                        onChange={(e) => setCalcAdFee(e.target.value)}
+                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-amber-300 font-semibold"
                       />
                     </div>
                     <div>
@@ -2610,8 +2776,8 @@
                       />
                     </div>
                     {calcType === "OWNED_STOCK" && (
-                      <div>
-                        <label className="text-xs text-slate-400">Owned Stock COGS (£)</label>
+                      <div className="col-span-2">
+                        <label className="text-xs text-slate-400">Owned Stock Acquisition Cost / COGS (£)</label>
                         <input
                           type="number"
                           step="0.01"
@@ -2629,7 +2795,7 @@
                       <span className="text-slate-200">{fmtGBP(sandboxResult.totalIngoing)}</span>
                     </div>
                     <div className="flex justify-between text-xs text-slate-400">
-                      <span>Direct Deductions</span>
+                      <span>Direct Deductions (Tx Fee + Ad Fee + P&P)</span>
                       <span className="text-rose-400">-{fmtGBP(sandboxResult.totalDirectCosts)}</span>
                     </div>
                     <div className="border-t border-slate-800 pt-2 flex justify-between font-bold text-white">
@@ -2661,95 +2827,108 @@
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
                       <div>
-                        <h2 className="text-base font-bold text-white">Consignee Payout Queue (60% Split)</h2>
+                        <h2 className="text-base font-bold text-white">Quick Start & Consignee Payout Queue</h2>
                         <p className="text-xs text-slate-400">
-                          Settle unpaid consignment sales and generate PDF statements
+                          Add consignees, upload eBay Stock/Sales CSVs, or settle unpaid 60% payouts
                         </p>
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <button
+                          onClick={() => setShowAddConsigneeModal(true)}
+                          className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium px-3 py-1.5 rounded-lg border border-slate-700"
+                        >
+                          + Consignee
+                        </button>
+                        <button
                           onClick={() => setShowEbayImportModal(true)}
-                          className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold px-3 py-1.5 rounded-lg transition"
+                          className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold px-3 py-1.5 rounded-lg"
                         >
                           📥 Import eBay CSV
                         </button>
                         <button
                           onClick={() => setShowAddStockModal(true)}
-                          className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition"
+                          className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg"
                         >
-                          + Add Inventory
+                          + Add Stock
                         </button>
                       </div>
                     </div>
 
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left text-sm">
-                        <thead>
-                          <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase">
-                            <th className="py-2.5 px-2">Consignee</th>
-                            <th className="py-2.5 px-2">Unpaid Sales</th>
-                            <th className="py-2.5 px-2">Net Profit</th>
-                            <th className="py-2.5 px-2">60% Payout Due</th>
-                            <th className="py-2.5 px-2">Your 40%</th>
-                            <th className="py-2.5 px-2 text-right">Action</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-800/60">
-                          {db.consignees.map((c) => {
-                            const unpaidSales = db.sales.filter((s) => {
-                              const item = db.inventory.find((i) => i.id === s.inventoryItemId);
-                              return s.payoutStatus === "UNPAID" && item?.consigneeId === c.id;
-                            });
-                            const totalNet = unpaidSales.reduce((a, s) => a + Number(s.netProfit), 0);
-                            const payout60 = unpaidSales.reduce((a, s) => a + Number(s.consigneePayoutAmount), 0);
-                            const business40 = unpaidSales.reduce((a, s) => a + Number(s.businessProfitShare), 0);
+                    {db.consignees.length === 0 ? (
+                      <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 text-center text-xs text-slate-400">
+                        No consignees added yet. Tap <strong>+ Consignee</strong> above to create your first consignee partner, or tap <strong>📥 Import eBay CSV</strong> to upload your eBay reports.
+                      </div>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-sm">
+                          <thead>
+                            <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase">
+                              <th className="py-2.5 px-2">Consignee</th>
+                              <th className="py-2.5 px-2">Unpaid Sales</th>
+                              <th className="py-2.5 px-2">Net Profit</th>
+                              <th className="py-2.5 px-2">60% Payout Due</th>
+                              <th className="py-2.5 px-2">Your 40%</th>
+                              <th className="py-2.5 px-2 text-right">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/60">
+                            {db.consignees.map((c) => {
+                              const unpaidSales = db.sales.filter(
+                                (s) => s.payoutStatus === "UNPAID" && s.consigneeId === c.id
+                              );
+                              const totalNet = unpaidSales.reduce((a, s) => a + Number(s.netProfit), 0);
+                              const payout60 = unpaidSales.reduce((a, s) => a + Number(s.consigneePayoutAmount), 0);
+                              const business40 = unpaidSales.reduce((a, s) => a + Number(s.businessProfitShare), 0);
 
-                            return (
-                              <tr key={c.id} className="hover:bg-slate-800/30">
-                                <td className="py-3 px-2 font-medium text-white">
-                                  {c.name}
-                                  <span className="block text-[11px] text-slate-400">{c.bankDetails}</span>
-                                </td>
-                                <td className="py-3 px-2 text-slate-300">{unpaidSales.length} items</td>
-                                <td className="py-3 px-2 text-slate-300">{fmtGBP(totalNet)}</td>
-                                <td className="py-3 px-2 font-semibold text-indigo-300">{fmtGBP(payout60)}</td>
-                                <td className="py-3 px-2 font-semibold text-emerald-300">{fmtGBP(business40)}</td>
-                                <td className="py-3 px-2 text-right">
-                                  {unpaidSales.length > 0 ? (
-                                    <button
-                                      onClick={() => handleSettleConsigneePayout(c.id)}
-                                      className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition"
-                                    >
-                                      Settle & PDF
-                                    </button>
-                                  ) : (
-                                    <span className="text-xs text-slate-500">Settled</span>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
+                              return (
+                                <tr key={c.id} className="hover:bg-slate-800/30">
+                                  <td className="py-3 px-2 font-medium text-white">
+                                    {c.name}
+                                    <span className="block text-[11px] text-slate-400">{c.bankDetails}</span>
+                                  </td>
+                                  <td className="py-3 px-2 text-slate-300">{unpaidSales.length} items</td>
+                                  <td className="py-3 px-2 text-slate-300">{fmtGBP(totalNet)}</td>
+                                  <td className="py-3 px-2 font-semibold text-indigo-300">{fmtGBP(payout60)}</td>
+                                  <td className="py-3 px-2 font-semibold text-emerald-300">{fmtGBP(business40)}</td>
+                                  <td className="py-3 px-2 text-right">
+                                    {unpaidSales.length > 0 ? (
+                                      <button
+                                        onClick={() => handleSettleConsigneePayout(c.id)}
+                                        className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg"
+                                      >
+                                        Settle & PDF
+                                      </button>
+                                    ) : (
+                                      <span className="text-xs text-slate-500">Settled</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
                   </div>
 
                   {/* Active Stock Ready to Sell */}
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
                     <div className="flex items-center justify-between mb-3">
-                      <h3 className="text-sm font-bold text-white">Active Stock Listed Across Channels</h3>
+                      <h3 className="text-sm font-bold text-white">Newest Active Stock ({db.inventory.length})</h3>
                       <button
-                        onClick={() => setActiveTab("ANALYTICS")}
+                        onClick={() => setActiveTab("INVENTORY")}
                         className="text-xs text-indigo-400 hover:underline"
                       >
-                        Explore Deep Analytics →
+                        Manage All Stock →
                       </button>
                     </div>
-                    <div className="space-y-2.5">
-                      {db.inventory
-                        .filter((i) => i.status === "ACTIVE")
-                        .slice(0, 5)
-                        .map((item) => {
+                    {filteredInventory.length === 0 ? (
+                      <p className="text-xs text-slate-400">
+                        Your Stock list is currently empty. Add items manually or import an eBay Active Listings CSV.
+                      </p>
+                    ) : (
+                      <div className="space-y-2.5">
+                        {filteredInventory.slice(0, 5).map((item) => {
                           const consignee = db.consignees.find((c) => c.id === item.consigneeId);
                           return (
                             <div
@@ -2770,39 +2949,35 @@
                                     }`}
                                   >
                                     {item.acquisitionType === "CONSIGNMENT"
-                                      ? `CONSIGNMENT (${consignee?.name})`
+                                      ? `CONSIGNMENT (${consignee?.name || "Unassigned"})`
                                       : `OWNED (COGS: ${fmtGBP(item.acquisitionCost)})`}
                                   </span>
                                 </div>
                                 <p className="text-sm font-medium text-white mt-1">{item.title}</p>
                               </div>
-                              <div className="flex items-center gap-2">
+                              <div className="flex items-center gap-1.5">
                                 <span className="text-sm font-bold text-white mr-1">
                                   {fmtGBP(item.listedPrice)}
                                 </span>
                                 <button
-                                  onClick={() => setEditingItem(item)}
-                                  className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2.5 py-1.5 rounded-lg border border-slate-700"
-                                >
-                                  ✏️ Edit
-                                </button>
-                                <button
-                                  onClick={() => setLabelModalItems([item])}
-                                  className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-slate-700"
-                                >
-                                  🏷️ Label
-                                </button>
-                                <button
                                   onClick={() => setSaleModalItem(item)}
                                   className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg"
                                 >
-                                  Record Sale
+                                  Move to Sold
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteStockItem(item.id)}
+                                  className="bg-rose-950/50 hover:bg-rose-900/60 text-rose-300 text-xs px-2.5 py-1.5 rounded-lg border border-rose-500/30"
+                                  title="Delete Stock Item"
+                                >
+                                  🗑️
                                 </button>
                               </div>
                             </div>
                           );
                         })}
-                    </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -2813,45 +2988,22 @@
                ========================================== */}
             {activeTab === "ANALYTICS" && (
               <div className="space-y-6">
-                {/* Gross-to-Net Revenue Waterfall Bar */}
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
-                    <div>
-                      <h2 className="text-base font-bold text-white">
-                        Gross Buyer Turnover Anatomy ({fmtGBP(deepStats.totalTopLineIngoing)} Total Ingoing)
-                      </h2>
-                      <p className="text-xs text-slate-400">
-                        Visual breakdown of where every £1 of buyer money goes across Fees, Postage/Pack, Owned COGS, Consignee 60% & Your Net Keep
-                      </p>
-                    </div>
+                  <div className="mb-3">
+                    <h2 className="text-base font-bold text-white">
+                      Gross Buyer Turnover Anatomy ({fmtGBP(deepStats.totalTopLineIngoing)} Total Ingoing)
+                    </h2>
+                    <p className="text-xs text-slate-400">
+                      Where every £1 of buyer payments goes across Your Net Keep, Consignee 60% Payouts, Owned COGS, Platform + Ad Fees, and Postage/Packaging
+                    </p>
                   </div>
 
                   <div className="w-full h-5 rounded-xl overflow-hidden flex bg-slate-950 border border-slate-800">
-                    <div
-                      style={{ width: `${deepStats.waterfall.businessKeepPct}%` }}
-                      className="bg-emerald-500 h-full"
-                      title={`Your Business Keep: ${deepStats.waterfall.businessKeepPct}%`}
-                    />
-                    <div
-                      style={{ width: `${deepStats.waterfall.consigneePct}%` }}
-                      className="bg-indigo-500 h-full"
-                      title={`Consignee 60% Share: ${deepStats.waterfall.consigneePct}%`}
-                    />
-                    <div
-                      style={{ width: `${deepStats.waterfall.cogsPct}%` }}
-                      className="bg-amber-500 h-full"
-                      title={`Owned Stock COGS: ${deepStats.waterfall.cogsPct}%`}
-                    />
-                    <div
-                      style={{ width: `${deepStats.waterfall.feesPct}%` }}
-                      className="bg-rose-500 h-full"
-                      title={`Platform Fees: ${deepStats.waterfall.feesPct}%`}
-                    />
-                    <div
-                      style={{ width: `${deepStats.waterfall.postagePackPct}%` }}
-                      className="bg-orange-400 h-full"
-                      title={`Postage & Packaging: ${deepStats.waterfall.postagePackPct}%`}
-                    />
+                    <div style={{ width: `${deepStats.waterfall.businessKeepPct}%` }} className="bg-emerald-500 h-full" />
+                    <div style={{ width: `${deepStats.waterfall.consigneePct}%` }} className="bg-indigo-500 h-full" />
+                    <div style={{ width: `${deepStats.waterfall.cogsPct}%` }} className="bg-amber-500 h-full" />
+                    <div style={{ width: `${deepStats.waterfall.feesPct}%` }} className="bg-rose-500 h-full" />
+                    <div style={{ width: `${deepStats.waterfall.postagePackPct}%` }} className="bg-orange-400 h-full" />
                   </div>
 
                   <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3 text-xs">
@@ -2872,8 +3024,8 @@
                     </div>
                     <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
                       <span className="inline-block w-2 h-2 rounded-full bg-rose-500 mr-1.5" />
-                      <span className="text-slate-400">Platform Fees ({deepStats.waterfall.feesPct}%)</span>
-                      <p className="font-bold text-rose-400 mt-0.5">{fmtGBP(deepStats.totalPlatformFees)}</p>
+                      <span className="text-slate-400">Tx + Ad Fees ({deepStats.waterfall.feesPct}%)</span>
+                      <p className="font-bold text-rose-400 mt-0.5">{fmtGBP(deepStats.combinedFeesAndAds)}</p>
                     </div>
                     <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800">
                       <span className="inline-block w-2 h-2 rounded-full bg-orange-400 mr-1.5" />
@@ -2895,29 +3047,23 @@
                         Avg {deepStats.avgDaysToSell} days to sell
                       </span>
                     </div>
-                    <div className="w-full bg-slate-800 h-2 rounded-full mt-2 overflow-hidden">
-                      <div
-                        className="bg-indigo-500 h-full"
-                        style={{ width: `${Math.min(100, deepStats.sellThroughRate)}%` }}
-                      />
-                    </div>
-                    <p className="text-[11px] text-slate-400 mt-1.5">
+                    <p className="text-[11px] text-slate-400 mt-2">
                       {deepStats.soldCount} sold items vs {deepStats.activeCount} active items in stock
                     </p>
                   </div>
 
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-                    <span className="text-xs text-slate-400">Platform Fee Bleed Rate</span>
+                    <span className="text-xs text-slate-400">Total Fee & Ad Bleed Rate</span>
                     <div className="flex items-baseline justify-between mt-1">
                       <span className="text-2xl font-bold text-rose-400">
                         {deepStats.feeBleedRatePercent}%
                       </span>
-                      <span className="text-xs text-slate-300">
-                        Total Fees: {fmtGBP(deepStats.totalPlatformFees)}
+                      <span className="text-xs text-amber-300">
+                        Ads Alone: {fmtGBP(deepStats.totalAdFees)} ({deepStats.adBleedRatePercent}%)
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-400 mt-2">
-                      Percentage of gross buyer payments ({fmtGBP(deepStats.totalTopLineIngoing)}) lost to platform fees
+                      Tx Fees ({fmtGBP(deepStats.totalPlatformFees)}) + Ad Fees ({fmtGBP(deepStats.totalAdFees)})
                     </p>
                   </div>
 
@@ -2937,7 +3083,7 @@
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-400 mt-2">
-                      Actual Postage ({fmtGBP(deepStats.totalActualPostage)}) + Packaging ({fmtGBP(deepStats.totalPackaging)}) vs Shipping Charged
+                      Actual Postage ({fmtGBP(deepStats.totalActualPostage)}) + Packaging ({fmtGBP(deepStats.totalPackaging)})
                     </p>
                   </div>
 
@@ -2952,7 +3098,7 @@
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-400 mt-2">
-                      Net profit multiple generated on Owned Stock acquisitions
+                      Net profit return on Owned Stock COGS sold ({fmtGBP(deepStats.totalSoldOwnedCogs)})
                     </p>
                   </div>
 
@@ -2967,7 +3113,7 @@
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-400 mt-2">
-                      Your estimated 40% Consignment + 100% Owned share if all current stock sells at listed price
+                      Estimated 40% Consignment + 100% Owned share sitting in unsold stock
                     </p>
                   </div>
 
@@ -2978,169 +3124,26 @@
                         {deepStats.businessKeepRatePercent}%
                       </span>
                       <span className="text-xs text-slate-400">
-                        Paid to Consignees: {fmtGBP(deepStats.totalConsigneeShare)}
+                        Consignee 60%: {fmtGBP(deepStats.totalConsigneeShare)}
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-400 mt-2">
-                      Share of every £1 in gross turnover retained by That Pop Culture Guy after fees, P&P & 60% payouts
+                      Percentage of total buyer payments kept by your business after all splits & costs
                     </p>
-                  </div>
-                </div>
-
-                {/* Category Profitability Matrix & Channel Efficiency */}
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-                  <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-5">
-                    <h3 className="text-base font-bold text-white mb-1">
-                      Category Profitability & Stock Matrix
-                    </h3>
-                    <p className="text-xs text-slate-400 mb-4">
-                      Which pop culture verticals generate the highest net business profit share
-                    </p>
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left text-xs">
-                        <thead>
-                          <tr className="border-b border-slate-800 text-slate-400 uppercase">
-                            <th className="py-2.5 px-2">Category</th>
-                            <th className="py-2.5 px-2">Active</th>
-                            <th className="py-2.5 px-2">Sold</th>
-                            <th className="py-2.5 px-2">Gross Sales</th>
-                            <th className="py-2.5 px-2">Total Net Profit</th>
-                            <th className="py-2.5 px-2 text-right">Your Business Keep</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-800/60">
-                          {deepStats.categoryBreakdown.map((cat) => (
-                            <tr key={cat.category} className="hover:bg-slate-800/30">
-                              <td className="py-3 px-2 font-semibold text-white">{cat.category}</td>
-                              <td className="py-3 px-2 text-sky-300">{cat.activeCount}</td>
-                              <td className="py-3 px-2 text-emerald-300">{cat.soldCount}</td>
-                              <td className="py-3 px-2 text-slate-300">{fmtGBP(cat.gross)}</td>
-                              <td className="py-3 px-2 text-slate-200">{fmtGBP(cat.netProfit)}</td>
-                              <td className="py-3 px-2 text-right font-bold text-emerald-400">
-                                {fmtGBP(cat.businessKeep)}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-
-                  <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-5">
-                    <h3 className="text-base font-bold text-white mb-1">
-                      Sales Channel Fee Drag vs Net Keep
-                    </h3>
-                    <p className="text-xs text-slate-400 mb-4">
-                      Compare eBay UK, Whatnot, and Cardmarket fee impact
-                    </p>
-                    <div className="space-y-3">
-                      {deepStats.channelBreakdown.map((ch) => {
-                        const feePct = ch.gross > 0 ? ((ch.fees / ch.gross) * 100).toFixed(1) : 0;
-                        return (
-                          <div
-                            key={ch.platform}
-                            className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 text-xs"
-                          >
-                            <div className="flex items-center justify-between font-bold text-white">
-                              <span>{ch.platform} ({ch.count} sales)</span>
-                              <span className="text-emerald-400">Keep: {fmtGBP(ch.businessKeep)}</span>
-                            </div>
-                            <div className="flex items-center justify-between text-slate-400 mt-1">
-                              <span>Gross Ingoing: {fmtGBP(ch.gross)}</span>
-                              <span className="text-rose-400">
-                                Fees: -{fmtGBP(ch.fees)} ({feePct}%)
-                              </span>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Consignee Partner Leaderboard & Aging Stock Radar */}
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-                  <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
-                    <h3 className="text-base font-bold text-white mb-1">
-                      Consignee Partner Leaderboard
-                    </h3>
-                    <p className="text-xs text-slate-400 mb-4">
-                      Ranked by 40% net profit contributed to That Pop Culture Guy
-                    </p>
-                    <div className="space-y-2.5">
-                      {deepStats.consigneeLeaderboard.map((c, idx) => (
-                        <div
-                          key={c.id}
-                          className="bg-slate-950 border border-slate-800 rounded-xl p-3 flex items-center justify-between text-xs"
-                        >
-                          <div>
-                            <span className="text-indigo-400 font-bold mr-2">#{idx + 1}</span>
-                            <span className="text-white font-semibold text-sm">{c.name}</span>
-                            <span className="block text-slate-400 mt-0.5">
-                              {c.soldCount} sold / {c.totalItems} total items • Gross: {fmtGBP(c.grossGenerated)}
-                            </span>
-                          </div>
-                          <div className="text-right">
-                            <span className="text-emerald-400 font-bold text-sm block">
-                              Your 40%: {fmtGBP(c.business40Earned)}
-                            </span>
-                            <span className="text-indigo-300 text-[11px]">
-                              Client 60%: {fmtGBP(c.consignee60Earned)}
-                            </span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
-                    <h3 className="text-base font-bold text-white mb-1">
-                      Stock Aging & Repricing Radar
-                    </h3>
-                    <p className="text-xs text-slate-400 mb-4">
-                      Active items sorted by days sitting in inventory
-                    </p>
-                    <div className="space-y-2.5">
-                      {deepStats.agingInventory.map((item) => (
-                        <div
-                          key={item.id}
-                          className="bg-slate-950 border border-slate-800 rounded-xl p-3 flex items-center justify-between text-xs"
-                        >
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono text-indigo-400">{item.sku}</span>
-                              <span className="text-amber-300 font-semibold">
-                                {item.daysListed} days listed
-                              </span>
-                            </div>
-                            <p className="text-white font-medium mt-0.5">{item.title}</p>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-white">{fmtGBP(item.listedPrice)}</span>
-                            <button
-                              onClick={() => setEditingItem(item)}
-                              className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-2 py-1 rounded border border-slate-700"
-                            >
-                              Reprice
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
                   </div>
                 </div>
               </div>
             )}
             {/* ==========================================
-                TAB 3: INVENTORY & STOCK
+                TAB 3: INVENTORY (ACTIVE STOCK ONLY)
                ========================================== */}
             {activeTab === "INVENTORY" && (
               <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-5">
                   <div>
-                    <h2 className="text-lg font-bold text-white">Inventory, Storage Bins & eBay Sync</h2>
+                    <h2 className="text-lg font-bold text-white">Active Stock ({filteredInventory.length})</h2>
                     <p className="text-xs text-slate-400">
-                      Upload eBay Active Stock CSVs, filter Consigned vs Owned items, edit bins/prices, and print barcode labels
+                      Sorted newest first. When an item sells, tap "Move to Sold" to transfer it out of Stock and into Sales.
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -3160,141 +3163,130 @@
                       <option value="CONSIGNMENT">Consigned Only</option>
                       <option value="OWNED_STOCK">Owned Only</option>
                     </select>
-                    <select
-                      value={stockFilterStatus}
-                      onChange={(e) => setStockFilterStatus(e.target.value)}
-                      className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white"
-                    >
-                      <option value="ALL">All Statuses</option>
-                      <option value="ACTIVE">ACTIVE</option>
-                      <option value="PAYOUT_PENDING">PAYOUT_PENDING</option>
-                      <option value="COMPLETED">COMPLETED</option>
-                    </select>
                     <button
                       onClick={() => setShowEbayImportModal(true)}
-                      className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold px-3 py-2 rounded-lg transition"
+                      className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold px-3 py-2 rounded-lg"
                     >
                       📥 Upload eBay CSV
                     </button>
-                    <button
-                      onClick={() => setLabelModalItems(filteredInventory)}
-                      className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium px-3 py-2 rounded-lg border border-slate-700"
-                    >
-                      🏷️ Print Labels ({filteredInventory.length})
-                    </button>
+                    {filteredInventory.length > 0 && (
+                      <button
+                        onClick={() => setLabelModalItems(filteredInventory)}
+                        className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium px-3 py-2 rounded-lg border border-slate-700"
+                      >
+                        🏷️ Labels ({filteredInventory.length})
+                      </button>
+                    )}
                     <button
                       onClick={() => setShowAddStockModal(true)}
                       className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3.5 py-2 rounded-lg"
                     >
-                      + Add Item
+                      + Add Stock
                     </button>
                   </div>
                 </div>
 
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-sm">
-                    <thead>
-                      <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase">
-                        <th className="py-3 px-2">SKU & Storage Bin</th>
-                        <th className="py-3 px-2">Item Title & Condition</th>
-                        <th className="py-3 px-2">Ownership</th>
-                        <th className="py-3 px-2">Listed Price</th>
-                        <th className="py-3 px-2">Status</th>
-                        <th className="py-3 px-2 text-right">Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-800/60">
-                      {filteredInventory.map((item) => {
-                        const consignee = db.consignees.find((c) => c.id === item.consigneeId);
-                        return (
-                          <tr key={item.id} className="hover:bg-slate-800/30">
-                            <td className="py-3.5 px-2">
-                              <span className="font-mono text-xs font-semibold text-indigo-400 block">
-                                {item.sku}
-                              </span>
-                              <span className="text-[11px] text-amber-300 font-mono block">
-                                📍 {item.storageLocation || "Vault A-01"}
-                              </span>
-                              <span className="text-[10px] text-slate-500">
-                                {item.platform} ({item.platformItemId})
-                              </span>
-                            </td>
-                            <td className="py-3.5 px-2">
-                              <span className="font-medium text-white block">{item.title}</span>
-                              <span className="text-xs text-slate-400">
-                                {item.category} • {item.condition}
-                              </span>
-                            </td>
-                            <td className="py-3.5 px-2">
-                              {item.acquisitionType === "CONSIGNMENT" ? (
-                                <span className="text-xs text-indigo-300 font-medium">
-                                  Consigned ({consignee?.name})
+                {filteredInventory.length === 0 ? (
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-8 text-center text-xs text-slate-400">
+                    No active stock items found. Tap <strong>+ Add Stock</strong> or <strong>📥 Upload eBay CSV</strong> to add inventory.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead>
+                        <tr className="border-b border-slate-800 text-xs text-slate-400 uppercase">
+                          <th className="py-3 px-2">Date / SKU / Bin</th>
+                          <th className="py-3 px-2">Item Title & Condition</th>
+                          <th className="py-3 px-2">Ownership</th>
+                          <th className="py-3 px-2">Listed Price</th>
+                          <th className="py-3 px-2 text-right">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/60">
+                        {filteredInventory.map((item) => {
+                          const consignee = db.consignees.find((c) => c.id === item.consigneeId);
+                          return (
+                            <tr key={item.id} className="hover:bg-slate-800/30">
+                              <td className="py-3.5 px-2">
+                                <span className="text-[11px] text-slate-400 block">{item.createdAt}</span>
+                                <span className="font-mono text-xs font-semibold text-indigo-400 block">
+                                  {item.sku}
                                 </span>
-                              ) : (
-                                <span className="text-xs text-emerald-300 font-medium">
-                                  Owned (COGS: {fmtGBP(item.acquisitionCost)})
+                                <span className="text-[11px] text-amber-300 font-mono block">
+                                  📍 {item.storageLocation || "Vault A-01"}
                                 </span>
-                              )}
-                            </td>
-                            <td className="py-3.5 px-2 font-semibold text-white">
-                              {fmtGBP(item.listedPrice)}
-                            </td>
-                            <td className="py-3.5 px-2">
-                              <span
-                                className={`px-2 py-0.5 text-[11px] rounded font-medium ${
-                                  item.status === "ACTIVE"
-                                    ? "bg-sky-500/20 text-sky-300"
-                                    : item.status === "PAYOUT_PENDING"
-                                    ? "bg-amber-500/20 text-amber-300"
-                                    : "bg-emerald-500/20 text-emerald-300"
-                                }`}
-                              >
-                                {item.status}
-                              </span>
-                            </td>
-                            <td className="py-3.5 px-2 text-right">
-                              <div className="flex items-center justify-end gap-1.5">
-                                <button
-                                  onClick={() => setEditingItem(item)}
-                                  className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2.5 py-1.5 rounded-lg border border-slate-700"
-                                >
-                                  ✏️ Edit
-                                </button>
-                                <button
-                                  onClick={() => setLabelModalItems([item])}
-                                  className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-2.5 py-1.5 rounded-lg border border-slate-700"
-                                >
-                                  🏷️ Label
-                                </button>
-                                {item.status === "ACTIVE" && (
+                              </td>
+                              <td className="py-3.5 px-2">
+                                <span className="font-medium text-white block">{item.title}</span>
+                                <span className="text-xs text-slate-400">
+                                  {item.category} • {item.condition} • {item.platform}
+                                </span>
+                              </td>
+                              <td className="py-3.5 px-2">
+                                {item.acquisitionType === "CONSIGNMENT" ? (
+                                  <span className="text-xs text-indigo-300 font-medium">
+                                    Consigned ({consignee?.name || "Unassigned"})
+                                  </span>
+                                ) : (
+                                  <span className="text-xs text-emerald-300 font-medium">
+                                    Owned (COGS: {fmtGBP(item.acquisitionCost)})
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-3.5 px-2 font-semibold text-white">
+                                {fmtGBP(item.listedPrice)}
+                              </td>
+                              <td className="py-3.5 px-2 text-right">
+                                <div className="flex items-center justify-end gap-1.5">
+                                  <button
+                                    onClick={() => setEditingItem(item)}
+                                    className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-2.5 py-1.5 rounded-lg border border-slate-700"
+                                  >
+                                    ✏️
+                                  </button>
+                                  <button
+                                    onClick={() => setLabelModalItems([item])}
+                                    className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-2.5 py-1.5 rounded-lg border border-slate-700"
+                                  >
+                                    🏷️
+                                  </button>
                                   <button
                                     onClick={() => setSaleModalItem(item)}
-                                    className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-1.5 rounded-lg"
+                                    className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg"
                                   >
-                                    Record Sale
+                                    Move to Sold
                                   </button>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+                                  <button
+                                    onClick={() => handleDeleteStockItem(item.id)}
+                                    className="bg-rose-950/50 hover:bg-rose-900/60 text-rose-300 text-xs px-2.5 py-1.5 rounded-lg border border-rose-500/30"
+                                    title="Delete Stock Item"
+                                  >
+                                    🗑️
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             )}
 
             {/* ==========================================
-                TAB 4: 60/40 SALES LEDGER
+                TAB 4: 60/40 SALES LEDGER (INLINE FEE EDITING)
                ========================================== */}
             {activeTab === "SALES" && (
               <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-                <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
+                <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
                   <div>
-                    <h2 className="text-lg font-bold text-white">Sales Records & 60/40 Profit-Split Ledger</h2>
+                    <h2 className="text-lg font-bold text-white">
+                      Sold Items & 60/40 Profit-Split Ledger ({sortedSales.length})
+                    </h2>
                     <p className="text-xs text-slate-400">
-                      Import eBay Orders CSVs, void/refund cancelled orders, or export HMRC spreadsheets
+                      Sorted newest at the top. Tap any Tx Fee, Ad Fee, or Postage box below to adjust costs live—60/40 splits update automatically!
                     </p>
                   </div>
                   <div className="flex gap-2">
@@ -3308,84 +3300,184 @@
                       onClick={downloadUkAccountantCsv}
                       className="bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-medium px-3.5 py-2 rounded-lg border border-slate-700"
                     >
-                      Download Accountant CSV
+                      Download UK Tax CSV
                     </button>
                   </div>
                 </div>
 
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-xs">
-                    <thead>
-                      <tr className="border-b border-slate-800 text-slate-400 uppercase">
-                        <th className="py-3 px-2">Date / SKU</th>
-                        <th className="py-3 px-2">Item & Buyer</th>
-                        <th className="py-3 px-2">Gross+Ship</th>
-                        <th className="py-3 px-2">Fees/P&P/COGS</th>
-                        <th className="py-3 px-2">Net Profit</th>
-                        <th className="py-3 px-2">Consignee 60%</th>
-                        <th className="py-3 px-2">Business Share</th>
-                        <th className="py-3 px-2 text-right">Status / Action</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-800/60">
-                      {db.sales.map((s) => {
-                        const item = db.inventory.find((i) => i.id === s.inventoryItemId);
-                        const grossPlusShip = Number(s.grossSalePrice) + Number(s.shippingChargedToBuyer);
-                        const deductions =
-                          Number(s.platformFeeAmount) +
-                          Number(s.actualPostageCost) +
-                          Number(s.packagingCost) +
-                          Number(s.ownedStockCogs);
+                {sortedSales.length === 0 ? (
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-8 text-center text-xs text-slate-400">
+                    No sales recorded yet. Import an eBay Orders CSV or click "Move to Sold" on any item in your Stock tab.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-800 text-slate-400 uppercase">
+                          <th className="py-3 px-1.5">Newest Date / SKU</th>
+                          <th className="py-3 px-1.5">Item & Ownership</th>
+                          <th className="py-3 px-1.5">Gross+Ship</th>
+                          <th className="py-3 px-1.5">Tx Fee (£)</th>
+                          <th className="py-3 px-1.5">Ad Fee (£)</th>
+                          <th className="py-3 px-1.5">Postage (£)</th>
+                          <th className="py-3 px-1.5">Pack (£)</th>
+                          <th className="py-3 px-1.5">Net Profit</th>
+                          <th className="py-3 px-1.5">60% / 40% Split</th>
+                          <th className="py-3 px-1.5 text-right">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/60">
+                        {sortedSales.map((s) => {
+                          const grossPlusShip =
+                            Number(s.grossSalePrice || 0) + Number(s.shippingChargedToBuyer || 0);
 
-                        return (
-                          <tr key={s.id} className="hover:bg-slate-800/30">
-                            <td className="py-3 px-2">
-                              <span className="text-white block">{s.saleDate}</span>
-                              <span className="font-mono text-indigo-400">{item?.sku}</span>
-                            </td>
-                            <td className="py-3 px-2">
-                              <span className="text-white font-medium block">{item?.title}</span>
-                              <span className="text-slate-400">Buyer: {s.buyerUsername || "N/A"}</span>
-                            </td>
-                            <td className="py-3 px-2 text-slate-200">{fmtGBP(grossPlusShip)}</td>
-                            <td className="py-3 px-2 text-rose-400">-{fmtGBP(deductions)}</td>
-                            <td className="py-3 px-2 font-bold text-white">{fmtGBP(s.netProfit)}</td>
-                            <td className="py-3 px-2 font-bold text-indigo-300">
-                              {fmtGBP(s.consigneePayoutAmount)}
-                            </td>
-                            <td className="py-3 px-2 font-bold text-emerald-300">
-                              {fmtGBP(s.businessProfitShare)}
-                            </td>
-                            <td className="py-3 px-2 text-right">
-                              <div className="flex items-center justify-end gap-2">
-                                <span
-                                  className={`px-2 py-0.5 rounded font-semibold text-[10px] ${
-                                    s.payoutStatus === "UNPAID"
-                                      ? "bg-amber-500/20 text-amber-300"
-                                      : s.payoutStatus === "PAID"
-                                      ? "bg-emerald-500/20 text-emerald-300"
-                                      : "bg-slate-800 text-slate-300"
-                                  }`}
-                                >
-                                  {s.payoutStatus}
+                          return (
+                            <tr key={s.id} className="hover:bg-slate-800/30">
+                              <td className="py-3 px-1.5 whitespace-nowrap">
+                                <span className="text-white font-semibold block">{s.saleDate}</span>
+                                <span className="font-mono text-indigo-400">{s.sku}</span>
+                              </td>
+                              <td className="py-3 px-1.5 max-w-[200px]">
+                                <span className="text-white font-medium block truncate" title={s.title}>
+                                  {s.title}
                                 </span>
-                                {s.payoutStatus !== "PAID" && (
-                                  <button
-                                    onClick={() => handleVoidSale(s.id)}
-                                    className="text-[11px] text-rose-400 hover:text-rose-300 bg-rose-950/40 border border-rose-500/30 px-2 py-1 rounded"
-                                    title="Void sale and return item to ACTIVE stock"
+                                <div className="flex items-center gap-1 mt-1">
+                                  <select
+                                    value={s.acquisitionType || "CONSIGNMENT"}
+                                    onChange={(e) =>
+                                      handleInlineSaleUpdate(s.id, "acquisitionType", e.target.value)
+                                    }
+                                    className="bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[10px] text-slate-300"
                                   >
-                                    ↩️ Void
+                                    <option value="CONSIGNMENT">Consigned</option>
+                                    <option value="OWNED_STOCK">Owned</option>
+                                  </select>
+                                  {s.acquisitionType === "CONSIGNMENT" ? (
+                                    <select
+                                      value={s.consigneeId || ""}
+                                      onChange={(e) =>
+                                        handleInlineSaleUpdate(s.id, "consigneeId", e.target.value)
+                                      }
+                                      className="bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[10px] text-indigo-300"
+                                    >
+                                      <option value="">-- Consignee --</option>
+                                      {db.consignees.map((c) => (
+                                        <option key={c.id} value={c.id}>
+                                          {c.name}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  ) : (
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      title="Owned Stock COGS (£)"
+                                      placeholder="COGS"
+                                      value={s.ownedStockCogs || 0}
+                                      onChange={(e) =>
+                                        handleInlineSaleUpdate(s.id, "ownedStockCogs", e.target.value)
+                                      }
+                                      className="w-14 bg-slate-950 border border-slate-800 rounded px-1 py-0.5 text-[10px] text-amber-300"
+                                    />
+                                  )}
+                                </div>
+                              </td>
+                              <td className="py-3 px-1.5 font-semibold text-slate-200 whitespace-nowrap">
+                                {fmtGBP(grossPlusShip)}
+                              </td>
+                              <td className="py-3 px-1.5">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={s.platformFeeAmount}
+                                  onChange={(e) =>
+                                    handleInlineSaleUpdate(s.id, "platformFeeAmount", e.target.value)
+                                  }
+                                  className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-rose-300 font-semibold"
+                                />
+                              </td>
+                              <td className="py-3 px-1.5">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={s.adFeeAmount || 0}
+                                  onChange={(e) =>
+                                    handleInlineSaleUpdate(s.id, "adFeeAmount", e.target.value)
+                                  }
+                                  className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-amber-300 font-semibold"
+                                />
+                              </td>
+                              <td className="py-3 px-1.5">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={s.actualPostageCost}
+                                  onChange={(e) =>
+                                    handleInlineSaleUpdate(s.id, "actualPostageCost", e.target.value)
+                                  }
+                                  className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-rose-200"
+                                />
+                              </td>
+                              <td className="py-3 px-1.5">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={s.packagingCost}
+                                  onChange={(e) =>
+                                    handleInlineSaleUpdate(s.id, "packagingCost", e.target.value)
+                                  }
+                                  className="w-14 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-slate-300"
+                                />
+                              </td>
+                              <td className="py-3 px-1.5 font-bold text-white whitespace-nowrap">
+                                {fmtGBP(s.netProfit)}
+                              </td>
+                              <td className="py-3 px-1.5 whitespace-nowrap">
+                                <span className="text-indigo-300 font-bold block">
+                                  60%: {fmtGBP(s.consigneePayoutAmount)}
+                                </span>
+                                <span className="text-emerald-400 font-bold block">
+                                  Biz: {fmtGBP(s.businessProfitShare)}
+                                </span>
+                              </td>
+                              <td className="py-3 px-1.5 text-right whitespace-nowrap">
+                                <div className="flex items-center justify-end gap-1">
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded font-semibold text-[10px] ${
+                                      s.payoutStatus === "UNPAID"
+                                        ? "bg-amber-500/20 text-amber-300"
+                                        : s.payoutStatus === "PAID"
+                                        ? "bg-emerald-500/20 text-emerald-300"
+                                        : "bg-slate-800 text-slate-400"
+                                    }`}
+                                  >
+                                    {s.payoutStatus}
+                                  </span>
+                                  {s.payoutStatus !== "PAID" && (
+                                    <button
+                                      onClick={() => handleVoidSale(s.id)}
+                                      className="text-[11px] text-sky-300 bg-sky-950/50 border border-sky-500/30 px-2 py-1 rounded"
+                                      title="Return item back to Active Stock"
+                                    >
+                                      ↩️ Stock
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={() => handleDeleteSaleRecord(s.id)}
+                                    className="text-[11px] text-rose-300 bg-rose-950/50 border border-rose-500/30 px-2 py-1 rounded"
+                                    title="Delete Sale Record"
+                                  >
+                                    🗑️
                                   </button>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             )}
 
@@ -3410,62 +3502,74 @@
                     </button>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    {db.consignees.map((c) => {
-                      const items = db.inventory.filter((i) => i.consigneeId === c.id);
-                      const unpaidSales = db.sales.filter((s) => {
-                        const item = db.inventory.find((i) => i.id === s.inventoryItemId);
-                        return s.payoutStatus === "UNPAID" && item?.consigneeId === c.id;
-                      });
-                      const unpaidTotal = unpaidSales.reduce(
-                        (acc, s) => acc + Number(s.consigneePayoutAmount),
-                        0
-                      );
+                  {db.consignees.length === 0 ? (
+                    <p className="text-xs text-slate-400">
+                      No consignees added yet. Tap <strong>+ New Consignee</strong> to create an account.
+                    </p>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      {db.consignees.map((c) => {
+                        const items = db.inventory.filter((i) => i.consigneeId === c.id);
+                        const unpaidSales = db.sales.filter(
+                          (s) => s.payoutStatus === "UNPAID" && s.consigneeId === c.id
+                        );
+                        const unpaidTotal = unpaidSales.reduce(
+                          (acc, s) => acc + Number(s.consigneePayoutAmount),
+                          0
+                        );
 
-                      return (
-                        <div
-                          key={c.id}
-                          className="bg-slate-950 border border-slate-800 rounded-xl p-4 flex flex-col justify-between"
-                        >
-                          <div>
-                            <div className="flex items-center justify-between">
-                              <h3 className="font-bold text-white text-base">{c.name}</h3>
-                              <span className="text-[11px] px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-semibold">
-                                {c.defaultSplit}/{100 - c.defaultSplit} Split
-                              </span>
-                            </div>
-                            <p className="text-xs text-slate-400 mt-1">{c.email} • {c.phone}</p>
-                            {c.address && <p className="text-xs text-slate-500 mt-0.5">{c.address}</p>}
-                            <div className="mt-2.5 p-2 rounded bg-slate-900 border border-slate-800 text-xs font-mono text-slate-300">
-                              {c.bankDetails}
-                            </div>
-                            {c.notes && <p className="text-xs text-slate-400 mt-2 italic">"{c.notes}"</p>}
-                          </div>
-                          <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between">
+                        return (
+                          <div
+                            key={c.id}
+                            className="bg-slate-950 border border-slate-800 rounded-xl p-4 flex flex-col justify-between"
+                          >
                             <div>
-                              <span className="text-[11px] text-slate-400 block">
-                                Total Stock: {items.length} items
-                              </span>
-                              <span className="text-sm font-bold text-indigo-300">
-                                Owing: {fmtGBP(unpaidTotal)}
-                              </span>
+                              <div className="flex items-center justify-between">
+                                <h3 className="font-bold text-white text-base">{c.name}</h3>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="text-[11px] px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-semibold">
+                                    {c.defaultSplit}/{100 - c.defaultSplit}
+                                  </span>
+                                  <button
+                                    onClick={() => handleDeleteConsignee(c.id)}
+                                    className="text-xs text-rose-400 hover:text-rose-300 px-1.5 py-0.5 rounded bg-rose-950/40"
+                                    title="Delete Consignee"
+                                  >
+                                    🗑️
+                                  </button>
+                                </div>
+                              </div>
+                              <p className="text-xs text-slate-400 mt-1">{c.email} • {c.phone}</p>
+                              <div className="mt-2.5 p-2 rounded bg-slate-900 border border-slate-800 text-xs font-mono text-slate-300">
+                                {c.bankDetails}
+                              </div>
                             </div>
-                            <button
-                              disabled={unpaidSales.length === 0}
-                              onClick={() => handleSettleConsigneePayout(c.id)}
-                              className={`px-3 py-1.5 rounded-lg text-xs font-medium ${
-                                unpaidSales.length > 0
-                                  ? "bg-indigo-600 hover:bg-indigo-500 text-white"
-                                  : "bg-slate-800 text-slate-500 cursor-not-allowed"
-                              }`}
-                            >
-                              {unpaidSales.length > 0 ? "Settle & Statement" : "Settled"}
-                            </button>
+                            <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between">
+                              <div>
+                                <span className="text-[11px] text-slate-400 block">
+                                  Active Stock: {items.length} • Unpaid Sold: {unpaidSales.length}
+                                </span>
+                                <span className="text-sm font-bold text-indigo-300">
+                                  Owing: {fmtGBP(unpaidTotal)}
+                                </span>
+                              </div>
+                              <button
+                                disabled={unpaidSales.length === 0}
+                                onClick={() => handleSettleConsigneePayout(c.id)}
+                                className={`px-3 py-1.5 rounded-lg text-xs font-medium ${
+                                  unpaidSales.length > 0
+                                    ? "bg-indigo-600 hover:bg-indigo-500 text-white"
+                                    : "bg-slate-800 text-slate-500 cursor-not-allowed"
+                                }`}
+                              >
+                                {unpaidSales.length > 0 ? "Settle & PDF" : "Settled"}
+                              </button>
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })}
-                  </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
 
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
@@ -3473,9 +3577,7 @@
                     Completed Payouts & Printable Settlement Statements
                   </h3>
                   {db.payouts.length === 0 ? (
-                    <p className="text-xs text-slate-400">
-                      No payouts settled yet. Tap "Settle & Statement" on any consignee above to generate a batch payout and printable PDF statement.
-                    </p>
+                    <p className="text-xs text-slate-400">No payouts settled yet.</p>
                   ) : (
                     <div className="space-y-2">
                       {db.payouts.map((po) => (
@@ -3490,7 +3592,7 @@
                               Paid {po.paidAt} • Ref: {po.paymentReference}
                             </span>
                           </div>
-                          <div className="flex items-center gap-3">
+                          <div className="flex items-center gap-2">
                             <span className="font-bold text-emerald-400">
                               {fmtGBP(po.totalPayoutAmount)}
                             </span>
@@ -3498,7 +3600,13 @@
                               onClick={() => setStatementModalPayout(po)}
                               className="bg-slate-800 hover:bg-slate-700 text-xs text-white px-3 py-1.5 rounded-lg border border-slate-700"
                             >
-                              View / Print Statement PDF
+                              Print Statement PDF
+                            </button>
+                            <button
+                              onClick={() => handleDeletePayout(po.id)}
+                              className="bg-rose-950/50 text-rose-300 text-xs px-2.5 py-1.5 rounded-lg border border-rose-500/30"
+                            >
+                              🗑️
                             </button>
                           </div>
                         </div>
@@ -3518,81 +3626,89 @@
                   <div className="flex items-center justify-between mb-4">
                     <div>
                       <h2 className="text-base font-bold text-white">Business Expenses & Receipts</h2>
-                      <p className="text-xs text-slate-400">
-                        Deductible overheads reduce UK taxable net profit
-                      </p>
+                      <p className="text-xs text-slate-400">Sorted newest first</p>
                     </div>
                     <button
                       onClick={() => setShowAddExpenseModal(true)}
                       className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg"
                     >
-                      + Log Expense & Receipt
+                      + Log Expense
                     </button>
                   </div>
-                  <div className="space-y-2.5">
-                    {db.expenses.map((exp) => (
-                      <div
-                        key={exp.id}
-                        className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-sm"
-                      >
-                        <div>
-                          <div className="flex items-center gap-2">
+                  {db.expenses.length === 0 ? (
+                    <p className="text-xs text-slate-400">No expenses logged yet.</p>
+                  ) : (
+                    <div className="space-y-2.5">
+                      {db.expenses.map((exp) => (
+                        <div
+                          key={exp.id}
+                          className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-sm"
+                        >
+                          <div>
                             <span className="font-medium text-white">{exp.merchant}</span>
-                            <span className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-300">
-                              {exp.category}
-                            </span>
+                            <span className="text-xs text-slate-400 block">{exp.description}</span>
+                            <span className="text-[11px] text-indigo-400 block">{exp.expenseDate}</span>
                           </div>
-                          <span className="text-xs text-slate-400 block mt-0.5">{exp.description}</span>
-                          <span className="text-[11px] text-indigo-400 block mt-0.5">
-                            {exp.expenseDate} • Receipt: {exp.receiptName}
-                          </span>
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-rose-400">-{fmtGBP(exp.amount)}</span>
+                            <button
+                              onClick={() => handleDeleteExpense(exp.id)}
+                              className="bg-rose-950/50 text-rose-300 text-xs px-2 py-1 rounded border border-rose-500/30"
+                            >
+                              🗑️
+                            </button>
+                          </div>
                         </div>
-                        <div className="text-right">
-                          <span className="font-bold text-rose-400 block">-{fmtGBP(exp.amount)}</span>
-                          <span className="text-[10px] text-emerald-400">
-                            {exp.allocatedToItemSale ? "Item-Allocated" : "HMRC Deductible"}
-                          </span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
                   <h2 className="text-base font-bold text-white mb-1">Cash-Flow Ledger (Ingoings/Outgoings)</h2>
-                  <p className="text-xs text-slate-400 mb-4">
-                    Live audit trail of gross receipts, fee deductions, COGS, expenses & 60% payouts
-                  </p>
-                  <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
-                    {db.cashFlow.map((cf) => (
-                      <div
-                        key={cf.id}
-                        className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-xs"
-                      >
-                        <div>
-                          <span
-                            className={`px-1.5 py-0.5 rounded font-bold text-[10px] mr-2 ${
-                              cf.type === "INGOING"
-                                ? "bg-emerald-500/20 text-emerald-300"
-                                : "bg-rose-500/20 text-rose-300"
-                            }`}
-                          >
-                            {cf.type}
-                          </span>
-                          <span className="text-slate-400">{cf.entryDate} • {cf.source}</span>
-                          <p className="text-slate-200 font-medium mt-1">{cf.description}</p>
-                        </div>
-                        <span
-                          className={`font-bold whitespace-nowrap ml-2 ${
-                            cf.type === "INGOING" ? "text-emerald-400" : "text-rose-400"
-                          }`}
+                  <p className="text-xs text-slate-400 mb-4">Sorted newest first</p>
+                  {db.cashFlow.length === 0 ? (
+                    <p className="text-xs text-slate-400">No cash-flow entries yet.</p>
+                  ) : (
+                    <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
+                      {db.cashFlow.map((cf) => (
+                        <div
+                          key={cf.id}
+                          className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-xs"
                         >
-                          {cf.type === "INGOING" ? "+" : "-"}
-                          {fmtGBP(cf.amount)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
+                          <div>
+                            <span
+                              className={`px-1.5 py-0.5 rounded font-bold text-[10px] mr-2 ${
+                                cf.type === "INGOING"
+                                  ? "bg-emerald-500/20 text-emerald-300"
+                                  : "bg-rose-500/20 text-rose-300"
+                              }`}
+                            >
+                              {cf.type}
+                            </span>
+                            <span className="text-slate-400">{cf.entryDate}</span>
+                            <p className="text-slate-200 font-medium mt-1">{cf.description}</p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={`font-bold whitespace-nowrap ${
+                                cf.type === "INGOING" ? "text-emerald-400" : "text-rose-400"
+                              }`}
+                            >
+                              {cf.type === "INGOING" ? "+" : "-"}
+                              {fmtGBP(cf.amount)}
+                            </span>
+                            <button
+                              onClick={() => handleDeleteCashFlowEntry(cf.id)}
+                              className="bg-rose-950/50 text-rose-300 px-2 py-1 rounded border border-rose-500/30"
+                            >
+                              🗑️
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -3604,9 +3720,7 @@
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                 <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
                   <div className="flex items-center justify-between mb-3">
-                    <h2 className="text-base font-bold text-white">
-                      UK HMRC Tax Liability Engine (2026/27)
-                    </h2>
+                    <h2 className="text-base font-bold text-white">UK HMRC Tax Liability Engine (2026/27)</h2>
                     <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs">
                       <button
                         onClick={() => setTaxEntityMode("SOLE_TRADER")}
@@ -3642,23 +3756,7 @@
                     </div>
                     <div className="border-t border-slate-800 pt-2 flex justify-between font-bold">
                       <span>HMRC Taxable Net Profit</span>
-                      <span className="text-emerald-400">
-                        {fmtGBP(metrics.taxBreakdown.taxableNetProfit)}
-                      </span>
-                    </div>
-                    <div className="border-t border-slate-800 pt-2 space-y-1 text-xs">
-                      <div className="flex justify-between text-slate-300">
-                        <span>
-                          {taxEntityMode === "SOLE_TRADER" ? "Income Tax:" : "Corporation Tax:"}
-                        </span>
-                        <span>{fmtGBP(metrics.taxBreakdown.incomeOrCorpTax)}</span>
-                      </div>
-                      {taxEntityMode === "SOLE_TRADER" && (
-                        <div className="flex justify-between text-slate-300">
-                          <span>Class 4 National Insurance:</span>
-                          <span>{fmtGBP(metrics.taxBreakdown.class4NationalInsurance)}</span>
-                        </div>
-                      )}
+                      <span className="text-emerald-400">{fmtGBP(metrics.taxBreakdown.taxableNetProfit)}</span>
                     </div>
                     <div className="flex justify-between font-bold text-amber-400 pt-1">
                       <span>Total Estimated UK Tax Reserve</span>
@@ -3684,32 +3782,44 @@
                       <input type="file" accept=".json" onChange={importDatabaseBackupJson} className="hidden" />
                     </label>
                     <button
-                      onClick={resetDemoData}
-                      className="bg-slate-900 hover:bg-slate-800 text-slate-400 text-xs px-3 py-2 rounded-lg border border-slate-800"
+                      onClick={clearAllPlatformData}
+                      className="bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 text-xs px-3 py-2 rounded-lg border border-rose-500/30"
                     >
-                      Reset Demo
+                      🗑️ Wipe All Data
                     </button>
                   </div>
                 </div>
 
                 <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-5">
                   <h2 className="text-base font-bold text-white mb-3">Document Management Vault</h2>
-                  <div className="space-y-2 max-h-[380px] overflow-y-auto">
-                    {db.documents.map((doc) => (
-                      <div
-                        key={doc.id}
-                        className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-xs"
-                      >
-                        <div>
-                          <span className="font-medium text-white block">{doc.fileName}</span>
-                          <span className="text-slate-400">{doc.linkedTo} • {doc.uploadedAt}</span>
+                  {db.documents.length === 0 ? (
+                    <p className="text-xs text-slate-400">No documents uploaded yet.</p>
+                  ) : (
+                    <div className="space-y-2 max-h-[380px] overflow-y-auto">
+                      {db.documents.map((doc) => (
+                        <div
+                          key={doc.id}
+                          className="bg-slate-950 border border-slate-800 rounded-lg p-3 flex items-center justify-between text-xs"
+                        >
+                          <div>
+                            <span className="font-medium text-white block">{doc.fileName}</span>
+                            <span className="text-slate-400">{doc.linkedTo} • {doc.uploadedAt}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px]">
+                              {doc.documentType}
+                            </span>
+                            <button
+                              onClick={() => handleDeleteDocument(doc.id)}
+                              className="bg-rose-950/50 text-rose-300 px-2 py-1 rounded border border-rose-500/30"
+                            >
+                              🗑️
+                            </button>
+                          </div>
                         </div>
-                        <span className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[10px]">
-                          {doc.documentType}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -3729,7 +3839,7 @@
           {saleModalItem && (
             <RecordSaleModal
               item={saleModalItem}
-              consignee={db.consignees.find((c) => c.id === saleModalItem.consigneeId)}
+              consignees={db.consignees}
               onClose={() => setSaleModalItem(null)}
               onConfirm={handleConfirmRecordSale}
             />
@@ -3741,78 +3851,52 @@
                 <h3 className="text-lg font-bold text-white mb-1">Edit Stock Item / Reprice</h3>
                 <p className="text-xs text-indigo-300 mb-4 font-mono">{editingItem.sku}</p>
                 <form onSubmit={handleEditStockSave} className="space-y-3 text-sm">
-                  <div>
-                    <label className="text-xs text-slate-400">Item Title</label>
+                  <input
+                    name="title"
+                    required
+                    defaultValue={editingItem.title}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                  />
+                  <div className="grid grid-cols-2 gap-3">
                     <input
-                      name="title"
+                      name="listedPrice"
+                      type="number"
+                      step="0.01"
                       required
-                      defaultValue={editingItem.title}
-                      className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                      defaultValue={editingItem.listedPrice}
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                    />
+                    <input
+                      name="storageLocation"
+                      required
+                      defaultValue={editingItem.storageLocation || "Vault A-01"}
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-amber-300"
                     />
                   </div>
                   <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="text-xs text-slate-400">Listed Price (£)</label>
-                      <input
-                        name="listedPrice"
-                        type="number"
-                        step="0.01"
-                        required
-                        defaultValue={editingItem.listedPrice}
-                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-xs text-slate-400">Storage Bin</label>
-                      <input
-                        name="storageLocation"
-                        required
-                        defaultValue={editingItem.storageLocation || "Vault A-01"}
-                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-amber-300"
-                      />
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="text-xs text-slate-400">Condition</label>
-                      <input
-                        name="condition"
-                        required
-                        defaultValue={editingItem.condition}
-                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-xs text-slate-400">Sales Channel</label>
-                      <select
-                        name="platform"
-                        defaultValue={editingItem.platform || "EBAY"}
-                        className="w-full mt-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
-                      >
-                        <option value="EBAY">eBay UK (Biz)</option>
-                        <option value="EBAY_PRIVATE">eBay UK (Private)</option>
-                        <option value="WHATNOT">Whatnot UK</option>
-                        <option value="CARDMARKET">Cardmarket</option>
-                        <option value="VINTED">Vinted UK</option>
-                        <option value="SHOPIFY">Shopify UK</option>
-                        <option value="IN_PERSON_EVENT">In-Person Show</option>
-                      </select>
-                    </div>
+                    <input
+                      name="condition"
+                      required
+                      defaultValue={editingItem.condition}
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                    />
+                    <select
+                      name="platform"
+                      defaultValue={editingItem.platform || "EBAY"}
+                      className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white"
+                    >
+                      <option value="EBAY">eBay UK (Biz)</option>
+                      <option value="EBAY_PRIVATE">eBay UK (Private)</option>
+                      <option value="WHATNOT">Whatnot UK</option>
+                      <option value="CARDMARKET">Cardmarket</option>
+                      <option value="VINTED">Vinted UK</option>
+                      <option value="SHOPIFY">Shopify UK</option>
+                      <option value="IN_PERSON_EVENT">In-Person Show</option>
+                    </select>
                   </div>
                   <div className="flex justify-end gap-2 pt-3">
-                    <button
-                      type="button"
-                      onClick={() => setEditingItem(null)}
-                      className="px-4 py-2 text-xs text-slate-400"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="submit"
-                      className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-4 py-2 rounded-lg"
-                    >
-                      Save Changes
-                    </button>
+                    <button type="button" onClick={() => setEditingItem(null)} className="px-4 py-2 text-xs text-slate-400">Cancel</button>
+                    <button type="submit" className="bg-indigo-600 text-white text-xs font-medium px-4 py-2 rounded-lg">Save Changes</button>
                   </div>
                 </form>
               </div>
@@ -3843,6 +3927,7 @@
                       <option value="OWNED_STOCK">OWNED_STOCK (100%)</option>
                     </select>
                     <select name="consigneeId" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white">
+                      <option value="">-- Select Consignee --</option>
                       {db.consignees.map((c) => (
                         <option key={c.id} value={c.id}>{c.name}</option>
                       ))}
@@ -3889,7 +3974,7 @@
                     <input name="defaultSplit" type="number" defaultValue="60" placeholder="Split %" className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
                   </div>
                   <input name="address" placeholder="UK Postal Address" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
-                  <input name="notes" placeholder="Notes (e.g. Pokemon & LEGO specialist)" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
+                  <input name="notes" placeholder="Notes" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white" />
                   <div>
                     <label className="text-xs text-slate-400">Attach Signed Consignment Contract (PDF)</label>
                     <input name="agreementFile" type="file" className="w-full mt-1 text-xs text-slate-400 file:mr-2 file:py-1 file:px-2.5 file:rounded file:border-0 file:bg-slate-800 file:text-slate-200" />
@@ -3966,7 +4051,7 @@
                         <th className="py-1">SKU</th>
                         <th className="py-1">Title</th>
                         <th className="py-1">Gross+Ship</th>
-                        <th className="py-1">Fees/P&P</th>
+                        <th className="py-1">Fees/Ad/P&P</th>
                         <th className="py-1">Net Profit</th>
                         <th className="py-1 text-right">Your 60%</th>
                       </tr>
